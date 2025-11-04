@@ -115,6 +115,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     prefix_size: int = 0
+    calibrate: bool = False
 
 class GPT(nn.Module):
 
@@ -167,6 +168,48 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def smooth_vector_ECE(self, logits, targets):
+        """
+        Computes smooth ECE loss on full predictions and targets. 
+        """
+        probs = F.softmax(logits, dim=-1)
+
+        labels = torch.zeros_like(logits)
+        labels.scatter_(-1, targets.unsqueeze(-1), 1)
+
+        # get indices of highest probability for each batch and context
+        max_prob_indices = torch.argmax(probs, dim=-1)
+
+        # max probs is a tensor of size batch size x context size with max_probs[b,t] = max(probs[b,t,:])
+        max_probs = torch.max(probs, dim=-1)
+        # print("max_probs:", max_probs)
+
+        max_prob_labels = labels.gather(-1, max_prob_indices.unsqueeze(-1)).squeeze(-1)
+
+        # compute weights
+        K = 5 # number of centers
+        centers = torch.linspace(0, 1, K, device=logits.device, dtype=probs.dtype)
+
+        sigma = 0.1 # standard deviation of the Gaussian
+        # Compute the unnormalized weights
+        diff = max_probs.values.unsqueeze(-1) - centers  # shape: [batch, t, K]
+        unnorm_weights = torch.exp(- (diff ** 2) / (2 * sigma ** 2))  # [batch, t, K]
+        # Normalize across K dimension
+        weights = unnorm_weights / unnorm_weights.sum(dim=-1, keepdim=True)  # [batch, t, K]
+
+        S = weights.sum(dim=(0, 1))
+
+        p_bar = torch.empty(K, device=logits.device, dtype=probs.dtype)
+        for k in range(K):
+            p_bar[k] = ((weights[:, :, k] * max_probs.values).sum()) / S[k]
+        y_bar = torch.empty(K, device=logits.device, dtype=probs.dtype)
+        for k in range(K):
+            y_bar[k] = ((weights[:, :, k] * max_prob_labels).sum()) / S[k]
+
+        ece_loss = torch.sum(S * torch.abs(p_bar - y_bar)) / probs.size(0)
+        return ece_loss
+
 
     def forward(self, idx, targets=None):
         device = idx.device
@@ -195,12 +238,15 @@ class GPT(nn.Module):
                 #print(f"logits shape after shifting: {logits.shape}")
             # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+            sm_ece_loss = self.smooth_vector_ECE(logits, targets)
+            if self.config.calibrate:
+                loss = loss + sm_ece_loss
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
-
-        return logits, loss
+            sm_ece_loss = None
+        return logits, loss, sm_ece_loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

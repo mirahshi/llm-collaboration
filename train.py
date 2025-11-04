@@ -50,6 +50,8 @@ batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch si
 block_size = 1024
 # prefix length to ignore in loss (overridden by config files like config/train_arithmetic.py)
 prefix_size = 0
+# calibrate?
+calibrate = False
 # model
 n_layer = 12
 n_head = 12
@@ -147,7 +149,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout, prefix_size=prefix_size) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, prefix_size=prefix_size, calibrate=calibrate) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -220,12 +222,15 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        sm_ece_losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss, sm_ece_loss = model(X, Y)
             losses[k] = loss.item()
+            sm_ece_losses[k] = sm_ece_loss.item()
         out[split] = losses.mean()
+        out[split + '_sm_ece_loss'] = sm_ece_losses.mean()
     model.train()
     return out
 
@@ -266,13 +271,31 @@ while True:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
+            if calibrate:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "train/ce_loss": losses['train'] - losses['train_sm_ece_loss'],
+                    "val/ce_loss": losses['val'] - losses['val_sm_ece_loss'],
+                    "train/sm_ece_loss": losses['train_sm_ece_loss'],
+                    "val/sm_ece_loss": losses['val_sm_ece_loss'],
+                    "lr": lr,
+                    "mfu": running_mfu*100, # convert to percentage
+                })
+            else:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "train/ce_loss": losses['train'],
+                    "val/ce_loss": losses['val'],
+                    "train/sm_ece_loss": losses['train_sm_ece_loss'],
+                    "val/sm_ece_loss": losses['val_sm_ece_loss'],
+                    "lr": lr,
+                    "mfu": running_mfu*100, # convert to percentage
+                })
+
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -299,7 +322,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss, sm_ece_loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')

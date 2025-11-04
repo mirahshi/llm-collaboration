@@ -9,14 +9,17 @@ log_interval = 10 # don't print too too often
 # we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False
 
-wandb_log = False # override via command line if you like
+wandb_log = True # override via command line if you like
 wandb_project = 'arithmetic'
 wandb_run_name = 'mini-gpt'
 
 dataset = 'arithmetic'
 gradient_accumulation_steps = 1
 batch_size = 64
-block_size = 256 # context of up to 256 previous characters
+block_size = 32 # 256 # context of up to 256 previous characters
+
+# calibrate?
+calibrate = False
 
 # get prefix size from input.txt
 with open(f'data/{dataset}/input.txt', 'r') as f:
