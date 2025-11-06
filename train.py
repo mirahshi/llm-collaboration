@@ -52,6 +52,7 @@ block_size = 1024
 prefix_size = 0
 # calibrate?
 calibrate = False
+multiplier = 1.0 # multiplier for calibration loss
 # model
 n_layer = 12
 n_head = 12
@@ -149,7 +150,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout, prefix_size=prefix_size, calibrate=calibrate) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, prefix_size=prefix_size, calibrate=calibrate, multiplier=multiplier) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -222,15 +223,27 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        ece_losses = torch.zeros(eval_iters)
         sm_ece_losses = torch.zeros(eval_iters)
+        brier_scores = torch.zeros(eval_iters)
+        zero_one_losses = torch.zeros(eval_iters)
+        entropies = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss, sm_ece_loss = model(X, Y)
+                logits, loss, ece_loss, sm_ece_loss, brier_score, zero_one_loss, entropy = model(X, Y)
             losses[k] = loss.item()
+            ece_losses[k] = ece_loss.item()
             sm_ece_losses[k] = sm_ece_loss.item()
+            brier_scores[k] = brier_score.item()
+            zero_one_losses[k] = zero_one_loss.item()
+            entropies[k] = entropy.item()
         out[split] = losses.mean()
+        out[split + '_ece_loss'] = ece_losses.mean()
         out[split + '_sm_ece_loss'] = sm_ece_losses.mean()
+        out[split + '_brier_score'] = brier_scores.mean()
+        out[split + '_zero_one_loss'] = zero_one_losses.mean()
+        out[split + '_entropy'] = entropies.mean()
     model.train()
     return out
 
@@ -271,30 +284,23 @@ while True:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
-            if calibrate:
-                wandb.log({
-                    "iter": iter_num,
-                    "train/loss": losses['train'],
-                    "val/loss": losses['val'],
-                    "train/ce_loss": losses['train'] - losses['train_sm_ece_loss'],
-                    "val/ce_loss": losses['val'] - losses['val_sm_ece_loss'],
-                    "train/sm_ece_loss": losses['train_sm_ece_loss'],
-                    "val/sm_ece_loss": losses['val_sm_ece_loss'],
-                    "lr": lr,
-                    "mfu": running_mfu*100, # convert to percentage
-                })
-            else:
-                wandb.log({
-                    "iter": iter_num,
-                    "train/loss": losses['train'],
-                    "val/loss": losses['val'],
-                    "train/ce_loss": losses['train'],
-                    "val/ce_loss": losses['val'],
-                    "train/sm_ece_loss": losses['train_sm_ece_loss'],
-                    "val/sm_ece_loss": losses['val_sm_ece_loss'],
-                    "lr": lr,
-                    "mfu": running_mfu*100, # convert to percentage
-                })
+            wandb.log({
+                "iter": iter_num,
+                "train/loss": losses['train'],
+                "val/loss": losses['val'],
+                "train/ece_loss": losses['train_ece_loss'],
+                "val/ece_loss": losses['val_ece_loss'],
+                "train/sm_ece_loss": losses['train_sm_ece_loss'],
+                "val/sm_ece_loss": losses['val_sm_ece_loss'],
+                "train/brier_score": losses['train_brier_score'],
+                "val/brier_score": losses['val_brier_score'],
+                "train/zero_one_loss": losses['train_zero_one_loss'],
+                "val/zero_one_loss": losses['val_zero_one_loss'],
+                "train/entropy": losses['train_entropy'],
+                "val/entropy": losses['val_entropy'],
+                "lr": lr,
+                "mfu": running_mfu*100, # convert to percentage
+            })
 
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -322,7 +328,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss, sm_ece_loss = model(X, Y)
+            logits, loss, ece_loss, sm_ece_loss, brier_score, zero_one_loss, entropy = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')

@@ -1,25 +1,30 @@
 # train a miniature character-level shakespeare model
 # good for debugging and playing on macbooks and such
 
-out_dir = 'out-arithmetic'
+dataset = 'parity'
+
+out_dir = f'out-{dataset}'
 eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 10 # don't print too too often
+
+# calibrate?
+calibrate = None # [None, 'smECE', 'brier']
+multiplier = 1 # multiplier for calibration loss
 
 # we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False
 
 wandb_log = True # override via command line if you like
-wandb_project = 'arithmetic'
-wandb_run_name = 'mini-gpt'
+wandb_project = dataset
+if calibrate is not None:
+    wandb_run_name = f'cal-{calibrate}-x{multiplier}'
+else:
+    wandb_run_name = 'no-cal'
 
-dataset = 'arithmetic'
 gradient_accumulation_steps = 1
 batch_size = 64
 block_size = 32 # 256 # context of up to 256 previous characters
-
-# calibrate?
-calibrate = False
 
 # get prefix size from input.txt
 with open(f'data/{dataset}/input.txt', 'r') as f:
@@ -43,6 +48,6 @@ warmup_iters = 100 # not super necessary potentially
 
 # on macbook also add
 # device = 'cpu'  # run on cpu only
-# compile = False # do not torch compile the model
+compile = False # do not torch compile the model
 
 
