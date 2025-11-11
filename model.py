@@ -41,13 +41,19 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.causal = config.causal
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+            ones_mask =torch.ones(config.block_size, config.block_size)
+            if self.causal:
+                # causal mask to ensure that attention is only applied to the left in the input sequence
+                self.register_buffer("bias", torch.tril(ones_mask)
+                                            .view(1, 1, config.block_size, config.block_size))
+            else:
+                self.register_buffer("bias", ones_mask.view(1, 1, config.block_size, config.block_size))
+                
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -61,11 +67,11 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=self.causal)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # diagonal
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # diagonal if causal, the same otherwise
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -117,6 +123,7 @@ class GPTConfig:
     prefix_size: int = 0
     calibrate: bool = False
     multiplier: float = 1.0
+    causal: bool = True
 
 class GPT(nn.Module):
 
@@ -270,16 +277,16 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # print(f"targets shape before shifting: {targets.shape}")
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            # print(f"logits shape before shifting: {logits.shape}")
-            # print("prefix size: ", self.config.prefix_size)
             if self.config.prefix_size > 0: # if we are using a prefix, crop the logits and targets
                 logits = logits[:, self.config.prefix_size:, :]
                 targets = targets[:, self.config.prefix_size:]
-                # print(f"targets shape after shifting: {targets.shape}")
-                #print(f"logits shape after shifting: {logits.shape}")
+                probs = F.softmax(logits, dim=-1)
+                # probs0 = probs[:,:,1]
+                # probs1 = probs[:,:,2]
+                # print("probs0:", probs0)
+                # print("probs1:", probs1)
             # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
             ece_loss = self.ECE(logits, targets, smooth=False)
