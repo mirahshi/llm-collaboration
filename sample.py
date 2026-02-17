@@ -7,13 +7,17 @@ from contextlib import nullcontext
 import torch
 import tiktoken
 from model import GPTConfig, GPT
+from termcolor import colored
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out' # ignored if init_from is not 'resume'
-start = "7 + 3 + 9 * 1 =" # "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-num_samples = 10 # number of samples to draw
-max_new_tokens = 10 # 500 # number of tokens generated in each sample
+out_dir = 'out-collab_exp4' # ignored if init_from is not 'resume'
+model_name = 'round1_agent1'
+meta_file = 'meta1.pkl'
+start = 'FILE:data/majority-mask/input1.txt'
+# start = "7 + 3 + 9 * 1 =" # "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+num_samples = 100 # number of samples to draw
+max_new_tokens = 1 # 500 # number of tokens generated in each sample
 temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
 top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
 seed = 1337
@@ -34,7 +38,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # model
 if init_from == 'resume':
     # init from a model saved in a specific directory
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(out_dir, f'ckpt_{model_name}.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPT(gptconf)
@@ -56,7 +60,7 @@ if compile:
 # look for the meta pickle in case it is available in the dataset folder
 load_meta = False
 if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...
-    meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
+    meta_path = os.path.join('data', checkpoint['config']['dataset'], meta_file)
     load_meta = os.path.exists(meta_path)
 if load_meta:
     print(f"Loading meta from {meta_path}...")
@@ -66,6 +70,13 @@ if load_meta:
     stoi, itos = meta['stoi'], meta['itos']
     encode = lambda s: [stoi[c] for c in s]
     decode = lambda l: ''.join([itos[i] for i in l])
+elif init_from == 'resume' and checkpoint.get('model_args', {}).get('stoi') is not None and checkpoint.get('model_args', {}).get('itos') is not None:
+    # Use vocab mappings stored in checkpoint when meta file is unavailable.
+    print("No meta file found, using stoi/itos from checkpoint model_args...")
+    stoi = checkpoint['model_args']['stoi']
+    itos = checkpoint['model_args']['itos']
+    encode = lambda s: [stoi[c] for c in s]
+    decode = lambda l: ''.join([itos[i] for i in l])
 else:
     # ok let's assume gpt-2 encodings by default
     print("No meta.pkl found, assuming GPT-2 encodings...")
@@ -73,25 +84,72 @@ else:
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)
 
-# encode the beginning of the prompt
-if start.startswith('FILE:'):
-    with open(start[5:], 'r', encoding='utf-8') as f:
-        start = f.read()
-start_ids = encode(start)
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+# # encode the beginning of the prompt
+# if start.startswith('FILE:'):
+#     with open(start[5:], 'r', encoding='utf-8') as f:
+#         start = f.read()
+# start_ids = encode(start)
+# x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 # print(x.shape)
 # exit()
 # run generation
+print(colored(f"Generating from {model_name}...", 'light_yellow'))
 with torch.no_grad():
     with ctx:
-        for k in range(num_samples):
-            y = model.generate(x.clone(), max_new_tokens, temperature=temperature, top_k=top_k)
-            # print(decode(y[0].tolist()))
-            output = decode(y[0].tolist())
-            for char in output:
-                if char == '\n': # end at first newline
-                    print('\n', end='')
-                    break
-                else:
-                    print(char, end='')
-            # print('---------------')
+        if start.startswith('FILE:'):
+            input_path = start[5:]
+            block_size = model.config.block_size
+            output_path = os.path.join(out_dir, f'output_{model_name}.txt')
+            with open(output_path, 'w') as f:
+                pass
+            with open(input_path, 'r', encoding='utf-8') as f:
+                for i, line in enumerate(f): 
+                    if i >= num_samples:
+                        break
+                    # One example per line: use only the first block_size characters.
+                    start = line.rstrip('\n').split('=')[0] + '='
+                    start_ids = encode(start)
+                    x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+                    y, probs = model.generate_with_probs(x.clone(), max_new_tokens, temperature=temperature, top_k=top_k)
+                    output = decode(y[0].tolist())
+                    with open(output_path, "a", encoding="utf-8") as out:
+                        out.write(output.rstrip('\n') + " ")
+                        out.write(f"({probs[0][0][1].item()}, {probs[0][0][2].item()})\n")
+        else:
+            for k in range(num_samples):
+                y = model.generate(x.clone(), max_new_tokens, temperature=temperature, top_k=top_k)
+                # print(decode(y[0].tolist()))
+                output = decode(y[0].tolist())
+                for char in output:
+                    if char == '\n': # end at first newline
+                        print('\n', end='')
+                        break
+                    else:
+                        print(char, end='')
+                # print('---------------')
+print(colored("Done!", 'light_yellow'))
+# def generate_from_prompt(prompt):
+#     start_ids = encode(prompt)
+#     x = torch.tensor(start_ids, dtype=torch.long, device=device)
+#     y = model.generate(x.clone(), max_new_tokens, temperature=temperature, top_k=top_k)
+#     continuation_ids = y[0, x.size(1):x.size(1) + max_new_tokens].tolist()
+#     output = decode(continuation_ids)
+#     print(output)
+#     # print(probs)
+
+
+# # run generation
+# with torch.no_grad():
+#     with ctx:
+#         if start.startswith('FILE:'):
+#             input_path = start[5:]
+#             block_size = model.config.block_size
+#             with open(input_path, 'r', encoding='utf-8') as f:
+#                 for line in f:
+#                     # One example per line: use only the first block_size characters.
+#                     prompt = line.rstrip('\n')[:block_size]
+#                     print(prompt + "?")
+#                     generate_from_prompt(prompt)
+#         else:
+#             for _ in range(num_samples):
+#                 generate_from_prompt(start)
