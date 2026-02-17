@@ -51,8 +51,9 @@ wandb_group_name = 'exp'
 # number of agents
 num_agents = 1 # 1 or 2
 num_rounds = 1 # number of rounds of conversation
-pre_load_rounds = [] # rounds to pre-load collaborator models from
+start_from_round = 0 # start from round 
 save_models = False # save models after each round
+save_name_suffix = '' # specify suffix for saved model names
 # data
 datasets = ['openwebtext'] * num_agents # one dataset per agent
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -66,7 +67,9 @@ calibrate = 'smECE' # self-calibrate: None, 'smECE', 'brier'
 multiplier = 1 # multiplier for calibration loss
 cross_calibrate = True # cross-calibrate using smooth cross ECE
 cross_multiplier = 1 # multiplier for cross calibration loss
-confidence = True # use confidence calibration; otherwise use prediction calibration
+confidence = False # use confidence calibration; otherwise use probability calibration
+cross_probabilities = True # use collaborator's probabilities for cross calibration
+K = 5 # number of buckets for (cross) ECE
 # model
 n_layer = 12
 n_head = 12
@@ -275,11 +278,11 @@ class Agent():
 
     def get_collaborator_predictions(self, collaborator_x):
         with self.ctx:
-            # get predictions of collaborator model on inputs
-            collaborator_predictions = self.collaborator_model.generate(collaborator_x, max_new_tokens=1).detach()
+            # get predictions and probabilitiesof collaborator model on inputs
+            collaborator_predictions, collaborator_probs = self.collaborator_model.generate(collaborator_x, max_new_tokens=1, return_probs=True)
             # crop outputs to retrieve only the answer token
             collaborator_predictions = collaborator_predictions[:, self.base_prefix_size+1:]
-            return collaborator_predictions
+            return collaborator_predictions, collaborator_probs
     
     def append_collaborator_predictions(self, x, y, collaborator_predictions):
         # append collaborator predictions to end of prefix in x
@@ -305,12 +308,13 @@ class Agent():
             for k in range(self.config['eval_iters']):
                 X, Y, collaborator_X = self.get_batch(split)
                 if self.collaborator_model is not None: # get collaborator predictions and append to x
-                    collaborator_predictions = self.get_collaborator_predictions(collaborator_X)
+                    collaborator_predictions, collaborator_probs = self.get_collaborator_predictions(collaborator_X)
                     X, Y = self.append_collaborator_predictions(X, Y, collaborator_predictions)
                 else:
                     collaborator_predictions = None
+                    collaborator_probs = None
                 with self.ctx:
-                    logits, loss, ece_loss, sm_ece_loss, cross_ece_loss, sm_cross_ece_loss, brier_score, zero_one_loss, entropy = self.model(X, Y, collaborator_predictions, self.config['confidence']) # call foward function
+                    logits, loss, ece_loss, sm_ece_loss, cross_ece_loss, sm_cross_ece_loss, brier_score, zero_one_loss, entropy = self.model(X, Y, collaborator_predictions, collaborator_probs, self.config['confidence'], self.config['cross_probabilities'], self.config['K']) # call foward function
                 losses[k] = loss.item()
                 ece_losses[k] = ece_loss.item()
                 sm_ece_losses[k] = sm_ece_loss.item()
@@ -350,10 +354,11 @@ class Agent():
         # training loop
         X, Y, collaborator_X = self.get_batch('train') # fetch the very first batch
         if self.collaborator_model is not None: # get collaborator predictions and append to x
-            collaborator_predictions = self.get_collaborator_predictions(collaborator_X)
+            collaborator_predictions, collaborator_probs = self.get_collaborator_predictions(collaborator_X)
             X, Y = self.append_collaborator_predictions(X, Y, collaborator_predictions)
         else:
             collaborator_predictions = None
+            collaborator_probs = None
         t0 = time.time()
         local_iter_num = 0 # number of iterations in the lifetime of this process
         raw_model = self.model.module if self.ddp else self.model # unwrap DDP container if needed
@@ -420,7 +425,7 @@ class Agent():
                             'best_val_loss': self.best_val_loss,
                             'config': config,
                         }
-                    save_path = os.path.join(self.config['out_dir'], f'ckpt_round{self.round}_agent{self.id}.pt')
+                    save_path = os.path.join(self.config['out_dir'], f'ckpt_round{self.round}_agent{self.id}_{self.config['save_name_suffix']}.pt')
                     torch.save(checkpoint, save_path)
                     print(colored(f"saved round {self.round} agent {self.id} checkpoint to {save_path}", 'light_green'))
             if self.iter_num == 0 and self.config['eval_only']:
@@ -436,15 +441,16 @@ class Agent():
                     # looking at the source of that context manager, it just toggles this variable
                     self.model.require_backward_grad_sync = (micro_step == self.config['gradient_accumulation_steps'] - 1)
                 with self.ctx:
-                    logits, loss, ece_loss, sm_ece_loss, cross_ece_loss, sm_cross_ece_loss, brier_score, zero_one_loss, entropy = self.model(X, Y, collaborator_predictions, self.config['confidence'])
+                    logits, loss, ece_loss, sm_ece_loss, cross_ece_loss, sm_cross_ece_loss, brier_score, zero_one_loss, entropy = self.model(X, Y, collaborator_predictions, collaborator_probs, self.config['confidence'], self.config['cross_probabilities'], self.config['K'])
                     loss = loss / self.config['gradient_accumulation_steps'] # scale the loss to account for gradient accumulation
                 # immediately async prefetch next batch while model is doing the forward pass on the GPU
                 X, Y, collaborator_X = self.get_batch('train')
                 if self.collaborator_model is not None: # get collaborator predictions and append to x
-                    collaborator_predictions = self.get_collaborator_predictions(collaborator_X)
+                    collaborator_predictions, collaborator_probs = self.get_collaborator_predictions(collaborator_X)
                     X, Y = self.append_collaborator_predictions(X, Y, collaborator_predictions)
                 else:
                     collaborator_predictions = None
+                    collaborator_probs = None
                 # backward pass, with gradient scaling if training in fp16
                 self.scaler.scale(loss).backward()
             # clip the gradient
@@ -507,9 +513,13 @@ def train_converse(config):
     # training loop: agents take turns training in rounds
     current_model = None # collaborator model to be used by the next agent. in the first round, the first agent trains by itself.
     for r in range(config['num_rounds']):
+        
         agent_id = r % config['num_agents'] # determine which agent trains this round
-
-        if r in config['pre_load_rounds']:
+        
+        if r < config['start_from_round']-1:
+            print(colored(f"Round {r}: agent {agent_id} skips ==================================================", 'light_yellow'))
+            continue
+        elif r == config['start_from_round']-1:
             current_model = load_model(r, agent_id)
             print(colored(f"Round {r}: loaded agent {agent_id} model ==========================================", 'light_yellow'))
         else:

@@ -129,6 +129,7 @@ class GPTConfig:
     cross_calibrate: bool = False
     cross_multiplier: float = 1.0
     confidence: bool = True
+    cross_probabilities: bool = False
     causal: bool = True
 
 class GPT(nn.Module):
@@ -261,29 +262,27 @@ class GPT(nn.Module):
 
         return torch.sum(S * torch.abs(p_bar - y_bar)) / N
 
-    def cross_ECE(self, logits, targets, collaborator_predictions, collaborator_probs=None, K=5, smooth_collaborator=False, smooth_own=False, sigma=0.1, confidence=True):
+    def cross_ECE(self, logits, targets, collaborator_predictions, collaborator_probs=None, K=5, cross_probabilities=False, smooth_collaborator=False, smooth_own=False, sigma=0.1, confidence=True):
         """
         Computes cross ECE between the model and the collaborator: 
-        sum_{collaborator_predictions} ECE of the model conditional on collaborator's prediction.
+        sum_{collaborator_predictions/probs} ECE of the model conditional on collaborator's predictions/probs.
+        If cross_probabilities is True, use collaborator's probabilities to compute cross ECE. Otherwise, use predictions.
         """
-        # SMOOTH CROSS ECE ONLY MAKES SENSE IF PREDICTIONS ARE CONTINUOUS/ORDERED
-        if collaborator_predictions is not None: # use predictions 
-            # re-scale collaborator's predictions to lie between 0 and 1
-            # collaborator_probs = (collaborator_predictions - collaborator_predictions.min()) / (collaborator_predictions.max() - collaborator_predictions.min())
+        if cross_probabilities: # use probabilities
+            L = K # number of buckets
+            # binary tasks: predictions are probabilities place on token 1
+            idx = self.config.stoi["1"]
+            collaborator_predictions = collaborator_probs[:, :, idx]
+        else: # use predictions (smoothing only makes sense if predictions are continuous/ordered)
             L = len(torch.unique(collaborator_predictions)) # number of unique predictions
-            collaborator_min = collaborator_predictions.min()
-            collaborator_max = collaborator_predictions.max()
-            collaborator_probs = collaborator_predictions
-        else: # use probabilities
-            L = K
-            collaborator_min = 0.0
-            collaborator_max = 1.0
 
+        collaborator_min = collaborator_predictions.min()
+        collaborator_max = collaborator_predictions.max()
 
         if smooth_collaborator:
             # define soft buckets using Gaussian kernels
             centers_collaborator = torch.linspace(collaborator_min, collaborator_max, L, device=logits.device, dtype=logits.dtype)
-            diff = collaborator_probs.unsqueeze(-1) - centers_collaborator
+            diff = collaborator_predictions.unsqueeze(-1) - centers_collaborator
             unnorm_weights = torch.exp(- (diff ** 2) / (2 * sigma ** 2))
             weights_collaborator = unnorm_weights / unnorm_weights.sum(dim=-1, keepdim=True)
         else:
@@ -296,9 +295,9 @@ class GPT(nn.Module):
             weights_collaborator = torch.zeros(logits.size(0), logits.size(1), L, device=logits.device, dtype=logits.dtype)
             for l in range(L):
                 if l == L-1:
-                    weights_collaborator[:, :, l] = (collaborator_probs >= left_collaborator[:, :, l]) & (collaborator_probs <= right_collaborator[:, :, l])
+                    weights_collaborator[:, :, l] = (collaborator_predictions >= left_collaborator[:, :, l]) & (collaborator_predictions <= right_collaborator[:, :, l])
                 else:
-                    weights_collaborator[:, :, l] = (collaborator_probs >= left_collaborator[:, :, l]) & (collaborator_probs < right_collaborator[:, :, l])
+                    weights_collaborator[:, :, l] = (collaborator_predictions >= left_collaborator[:, :, l]) & (collaborator_predictions < right_collaborator[:, :, l])
             weights_collaborator = weights_collaborator.to(dtype=logits.dtype)
 
         N = logits.size(0) * logits.size(1) # number of examples (B*T)
@@ -342,7 +341,7 @@ class GPT(nn.Module):
         entropy = -torch.sum(probs * torch.log(probs), dim=-1)
         return entropy.mean(dim=(0,1))
 
-    def forward(self, idx, targets=None, collaborator_predictions=None, confidence=None):
+    def forward(self, idx, targets=None, collaborator_predictions=None, collaborator_probs=None, confidence=False, cross_probabilities=False, K=5):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -372,15 +371,15 @@ class GPT(nn.Module):
             # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
             #loss = 0
-            ece_loss = self.ECE(logits, targets, smooth=False, confidence=confidence)
-            sm_ece_loss = self.ECE(logits, targets, smooth=True, confidence=confidence)
+            ece_loss = self.ECE(logits, targets, K=K, smooth=False, confidence=confidence)
+            sm_ece_loss = self.ECE(logits, targets, K=K, smooth=True, confidence=confidence)
             brier_score = self.brier_score(logits, targets)
             zero_one_loss = self.zero_one_loss(logits, targets)
             
-            if collaborator_predictions is not None:
+            if collaborator_predictions is not None or collaborator_probs is not None:
                 # calculate cross calibration error wrt collaborator predictions
-                cross_ece_loss = self.cross_ECE(logits, targets, collaborator_predictions, smooth_collaborator=False, smooth_own=False, confidence=confidence)
-                sm_cross_ece_loss = self.cross_ECE(logits, targets, collaborator_predictions, smooth_collaborator=True, smooth_own=True, confidence=confidence)
+                cross_ece_loss = self.cross_ECE(logits, targets, collaborator_predictions, collaborator_probs, K=K, cross_probabilities=cross_probabilities, smooth_collaborator=False, smooth_own=False, confidence=confidence)
+                sm_cross_ece_loss = self.cross_ECE(logits, targets, collaborator_predictions, collaborator_probs, K=K, cross_probabilities=cross_probabilities, smooth_collaborator=True, smooth_own=True, confidence=confidence)
                 # if cross_ece_loss + 1e-6 < ece_loss:
                 #     print("self ECE loss:", ece_loss)
                 #     print("cross ECE loss:", cross_ece_loss)
@@ -397,13 +396,13 @@ class GPT(nn.Module):
                 sm_cross_ece_loss = None
 
             if self.config.calibrate == 'smECE':
-                if collaborator_predictions is None:
+                if collaborator_predictions is None and collaborator_probs is None:
                     loss = loss + sm_ece_loss * self.config.multiplier
                 else:
                     if self.config.cross_calibrate is False:
                         loss = loss + sm_ece_loss * self.config.multiplier
             elif self.config.calibrate == 'brier':
-                if collaborator_predictions is None:
+                if collaborator_predictions is None and collaborator_probs is None:
                     loss = loss + brier_score * self.config.multiplier
                 else:
                     if self.config.cross_calibrate is False:
@@ -532,41 +531,13 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, return_probs=False):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _, _, _, _, _, _, _, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
-
-    @torch.no_grad()
-    def generate_with_probs(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        Returns probability vector at each time. 
-        """
-        probs_list =[]
+        probs_list = []
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
@@ -585,6 +556,9 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
-
+        
         probs_list = torch.stack(probs_list, dim=1)
-        return idx, probs_list
+        if return_probs:
+            return idx, probs_list
+        else:
+            return idx

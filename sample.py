@@ -110,7 +110,7 @@ with torch.no_grad():
                     start = line.rstrip('\n').split('=')[0] + '='
                     start_ids = encode(start)
                     x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-                    y, probs = model.generate_with_probs(x.clone(), max_new_tokens, temperature=temperature, top_k=top_k)
+                    y, probs = model.generate(x.clone(), max_new_tokens, temperature=temperature, top_k=top_k, return_probs=True)
                     output = decode(y[0].tolist())
                     with open(output_path, "a", encoding="utf-8") as out:
                         out.write(output.rstrip('\n') + " ")
