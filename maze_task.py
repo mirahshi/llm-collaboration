@@ -226,7 +226,9 @@ def generate_samples(
         m2_flat = grid_to_flat(m2)
 
         solutions = [fmt(p) for p in paths]
-        samples = [format_sample(maze_flat, sol) for sol in solutions]
+        samples_full = [format_sample(maze_flat, sol) for sol in solutions]
+        samples_m1 = [format_sample(m1_flat, sol) for sol in solutions]
+        samples_m2 = [format_sample(m2_flat, sol) for sol in solutions]
 
         yield {
             "grid": grid,
@@ -235,7 +237,9 @@ def generate_samples(
             "m2": m2_flat,
             "paths": paths,
             "solutions": solutions,
-            "samples": samples,
+            "samples_full": samples_full,
+            "samples_m1": samples_m1,
+            "samples_m2": samples_m2,
         }
 
 
@@ -311,7 +315,13 @@ if __name__ == "__main__":
         print(visualize_grid(data["m2"], label="Agent 2 view (m2)"))
 
         # Flat training strings
-        print("\n  Training sample(s):")
-        for s in data["samples"]:
+        print("\n  Training samples (full maze):")
+        for s in data["samples_full"]:
+            print(f"    {s}")
+        print("\n  Training samples (m1 - agent 1):")
+        for s in data["samples_m1"]:
+            print(f"    {s}")
+        print("\n  Training samples (m2 - agent 2):")
+        for s in data["samples_m2"]:
             print(f"    {s}")
         print()
