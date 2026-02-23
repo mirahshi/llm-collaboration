@@ -2,8 +2,9 @@
 num_agents = 2
 num_rounds = 2
 start_from_round = 1 # which round to start from (begins at 0) 
-save_models = True # save models after each round
-save_name_suffix = 'crosscal' # specify suffix for saved model names
+save_models = False # save models after each round
+save_name_suffix = ''
+# save_name_suffix = '_crosscal' # include suffix for saved model names
 
 datasets = ['majority-mask'] * num_agents
 
@@ -19,11 +20,12 @@ log_interval = 10 # don't print too too often
 # calibrate?
 calibrate = 'smECE' # self-calibrate: None, 'smECE', 'brier'
 multiplier = 1 # multiplier for calibration loss
-cross_calibrate = True # cross-calibrate: smECE conditioned on collaborator's predictions
+cross_calibrate = False # cross-calibrate: smECE conditioned on collaborator's predictions
 cross_multiplier = 1 # multiplier for cross calibration loss
 confidence = False # use confidence calibration; otherwise use probability calibration
 cross_probabilities = True # use collaborator's probabilities for cross calibration
-K = 10 # number of buckets for (cross) ECE
+K = 3 # number of buckets for (cross) ECE
+top_k = 2 # number of top k predictions to use for ECE losses
 
 # we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False

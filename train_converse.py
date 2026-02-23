@@ -70,6 +70,7 @@ cross_multiplier = 1 # multiplier for cross calibration loss
 confidence = False # use confidence calibration; otherwise use probability calibration
 cross_probabilities = True # use collaborator's probabilities for cross calibration
 K = 5 # number of buckets for (cross) ECE
+top_k = 1 # number of top k predictions to use for ECE losses
 # model
 n_layer = 12
 n_head = 12
@@ -168,7 +169,7 @@ class Agent():
         # model init
         self.model_args = dict(n_layer=self.config['n_layer'], n_head=self.config['n_head'], n_embd=self.config['n_embd'], block_size=self.config['block_size'],
                         bias=self.config['bias'], vocab_size=None, stoi=self.meta_stoi, itos=self.meta_itos, dropout=self.config['dropout'], prefix_size=self.config['prefix_size'], example_size=self.config['example_size'], calibrate=self.config['calibrate'], multiplier=self.config['multiplier'], 
-                        cross_calibrate=self.config['cross_calibrate'], cross_multiplier=self.config['cross_multiplier'], confidence=self.config['confidence'], causal=self.config['causal']) # start with model_args from command line
+                        cross_calibrate=self.config['cross_calibrate'], cross_multiplier=self.config['cross_multiplier'], confidence=self.config['confidence'], causal=self.config['causal'], cross_probabilities=self.config['cross_probabilities'], K=self.config['K'], top_k=self.config['top_k']) # start with model_args from command line
         # update prefix size and block size if collaborator model is used
         if self.collaborator_model is not None:
             self.config['prefix_size'] += 1
@@ -278,7 +279,7 @@ class Agent():
 
     def get_collaborator_predictions(self, collaborator_x):
         with self.ctx:
-            # get predictions and probabilitiesof collaborator model on inputs
+            # get predictions and probabilities of collaborator model on inputs (no grad)
             collaborator_predictions, collaborator_probs = self.collaborator_model.generate(collaborator_x, max_new_tokens=1, return_probs=True)
             # crop outputs to retrieve only the answer token
             collaborator_predictions = collaborator_predictions[:, self.base_prefix_size+1:]
@@ -297,11 +298,16 @@ class Agent():
         self.model.eval()
         for split in ['train', 'val']:
             losses = torch.zeros(self.config['eval_iters'])
+            CE_losses = torch.zeros(self.config['eval_iters'])
             ece_losses = torch.zeros(self.config['eval_iters'])
+            ece_loss_multidims = torch.zeros(self.config['eval_iters'])
             sm_ece_losses = torch.zeros(self.config['eval_iters'])
+            sm_ece_loss_multidims = torch.zeros(self.config['eval_iters'])
             if self.collaborator_model is not None:
                 cross_ece_losses = torch.zeros(self.config['eval_iters'])
                 sm_cross_ece_losses = torch.zeros(self.config['eval_iters'])
+                cross_ece_loss_multidims = torch.zeros(self.config['eval_iters'])
+                sm_cross_ece_loss_multidims = torch.zeros(self.config['eval_iters'])
             brier_scores = torch.zeros(self.config['eval_iters'])
             zero_one_losses = torch.zeros(self.config['eval_iters'])
             entropies = torch.zeros(self.config['eval_iters'])
@@ -314,22 +320,32 @@ class Agent():
                     collaborator_predictions = None
                     collaborator_probs = None
                 with self.ctx:
-                    logits, loss, ece_loss, sm_ece_loss, cross_ece_loss, sm_cross_ece_loss, brier_score, zero_one_loss, entropy = self.model(X, Y, collaborator_predictions, collaborator_probs, self.config['confidence'], self.config['cross_probabilities'], self.config['K']) # call foward function
+                    logits, CE_loss, loss, ece_loss, ece_loss_multidim, sm_ece_loss, sm_ece_loss_multidim, cross_ece_loss, cross_ece_loss_multidim, sm_cross_ece_loss, sm_cross_ece_loss_multidim, brier_score, zero_one_loss, entropy = self.model(X, Y, collaborator_predictions, collaborator_probs) # call foward function
+                CE_losses[k] = CE_loss.item()
                 losses[k] = loss.item()
                 ece_losses[k] = ece_loss.item()
+                ece_loss_multidims[k] = ece_loss_multidim.item()
                 sm_ece_losses[k] = sm_ece_loss.item()
+                sm_ece_loss_multidims[k] = sm_ece_loss_multidim.item()
                 if self.collaborator_model is not None:
                     cross_ece_losses[k] = cross_ece_loss.item()
                     sm_cross_ece_losses[k] = sm_cross_ece_loss.item()
+                    cross_ece_loss_multidims[k] = cross_ece_loss_multidim.item()
+                    sm_cross_ece_loss_multidims[k] = sm_cross_ece_loss_multidim.item()
                 brier_scores[k] = brier_score.item()
                 zero_one_losses[k] = zero_one_loss.item()
                 entropies[k] = entropy.item()
             out[split] = losses.mean()
+            out[split + '_CE_loss'] = CE_losses.mean()
             out[split + '_ece_loss'] = ece_losses.mean()
             out[split + '_sm_ece_loss'] = sm_ece_losses.mean()
+            out[split + '_ece_loss_multidim'] = ece_loss_multidims.mean()
+            out[split + '_sm_ece_loss_multidim'] = sm_ece_loss_multidims.mean()
             if self.collaborator_model is not None:
                 out[split + '_cross_ece_loss'] = cross_ece_losses.mean()
                 out[split + '_sm_cross_ece_loss'] = sm_cross_ece_losses.mean()
+                out[split + '_cross_ece_loss_multidim'] = cross_ece_loss_multidims.mean()
+                out[split + '_sm_cross_ece_loss_multidim'] = sm_cross_ece_loss_multidims.mean()
             out[split + '_brier_score'] = brier_scores.mean()
             out[split + '_zero_one_loss'] = zero_one_losses.mean()
             out[split + '_entropy'] = entropies.mean()
@@ -379,10 +395,16 @@ class Agent():
                         "iter": self.iter_num,
                         "train/loss": losses['train'],
                         "val/loss": losses['val'],
+                        "train/CE_loss": losses['train_CE_loss'],
+                        "val/CE_loss": losses['val_CE_loss'],
                         "train/ece_loss": losses['train_ece_loss'],
                         "val/ece_loss": losses['val_ece_loss'],
                         "train/sm_ece_loss": losses['train_sm_ece_loss'],
                         "val/sm_ece_loss": losses['val_sm_ece_loss'],
+                        "train/ece_loss_multidim": losses['train_ece_loss_multidim'],
+                        "val/ece_loss_multidim": losses['val_ece_loss_multidim'],
+                        "train/sm_ece_loss_multidim": losses['train_sm_ece_loss_multidim'],
+                        "val/sm_ece_loss_multidim": losses['val_sm_ece_loss_multidim'],
                         "train/brier_score": losses['train_brier_score'],
                         "val/brier_score": losses['val_brier_score'],
                         "train/zero_one_loss": losses['train_zero_one_loss'],
@@ -398,6 +420,10 @@ class Agent():
                             "val/cross_ece_loss": losses['val_cross_ece_loss'],
                             "train/sm_cross_ece_loss": losses['train_sm_cross_ece_loss'],
                             "val/sm_cross_ece_loss": losses['val_sm_cross_ece_loss'],
+                            "train/cross_ece_loss_multidim": losses['train_cross_ece_loss_multidim'],
+                            "val/cross_ece_loss_multidim": losses['val_cross_ece_loss_multidim'],
+                            "train/sm_cross_ece_loss_multidim": losses['train_sm_cross_ece_loss_multidim'],
+                            "val/sm_cross_ece_loss_multidim": losses['val_sm_cross_ece_loss_multidim'],
                         })
                     wandb.log(log_data)
 
@@ -425,7 +451,7 @@ class Agent():
                             'best_val_loss': self.best_val_loss,
                             'config': config,
                         }
-                    save_path = os.path.join(self.config['out_dir'], f'ckpt_round{self.round}_agent{self.id}_{self.config['save_name_suffix']}.pt')
+                    save_path = os.path.join(self.config['out_dir'], f'ckpt_round{self.round}_agent{self.id}{self.config['save_name_suffix']}.pt')
                     torch.save(checkpoint, save_path)
                     print(colored(f"saved round {self.round} agent {self.id} checkpoint to {save_path}", 'light_green'))
             if self.iter_num == 0 and self.config['eval_only']:
@@ -441,7 +467,7 @@ class Agent():
                     # looking at the source of that context manager, it just toggles this variable
                     self.model.require_backward_grad_sync = (micro_step == self.config['gradient_accumulation_steps'] - 1)
                 with self.ctx:
-                    logits, loss, ece_loss, sm_ece_loss, cross_ece_loss, sm_cross_ece_loss, brier_score, zero_one_loss, entropy = self.model(X, Y, collaborator_predictions, collaborator_probs, self.config['confidence'], self.config['cross_probabilities'], self.config['K'])
+                    logits, CE_loss, loss, ece_loss, ece_loss_multidim, sm_ece_loss, sm_ece_loss_multidim, cross_ece_loss, cross_ece_loss_multidim, sm_cross_ece_loss, sm_cross_ece_loss_multidim, brier_score, zero_one_loss, entropy = self.model(X, Y, collaborator_predictions, collaborator_probs)
                     loss = loss / self.config['gradient_accumulation_steps'] # scale the loss to account for gradient accumulation
                 # immediately async prefetch next batch while model is doing the forward pass on the GPU
                 X, Y, collaborator_X = self.get_batch('train')
@@ -487,12 +513,24 @@ class Agent():
 
 def load_model(round, agent_id):
     """Load a saved round/agent checkpoint as a ready-to-use collaborator model."""
-    ckpt_path = os.path.join(config['out_dir'], f'ckpt_round{round}_agent{agent_id}.pt')
+    ckpt_path = os.path.join(config['out_dir'], f'ckpt_round{round}_agent{agent_id}{config['save_name_suffix']}.pt')
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     checkpoint = torch.load(ckpt_path, map_location=config['device'])
-    gptconf = GPTConfig(**checkpoint['model_args'])
+    # gptconf = GPTConfig(**checkpoint['model_args'])
+    # Start with current config values for all GPTConfig fields, then overlay
+    # the checkpoint's saved model_args. This ensures that new fields added
+    # after the checkpoint was created get their current config values instead
+    # of falling back to GPTConfig defaults.
+    saved_args = checkpoint['model_args']
+    model_args = {}
+    for field_name in GPTConfig.__dataclass_fields__:
+        if field_name in saved_args:
+            model_args[field_name] = saved_args[field_name]
+        elif field_name in config:
+            model_args[field_name] = config[field_name]
+    gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 
     state_dict = checkpoint['model']
@@ -505,6 +543,7 @@ def load_model(round, agent_id):
     model.load_state_dict(state_dict)
     model.to(config['device'])
     model.eval()
+    print(colored(f"loaded checkpoint from {ckpt_path}", 'light_green'))
     return model
 
 

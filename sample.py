@@ -11,8 +11,8 @@ from termcolor import colored
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out-collab_exp4' # ignored if init_from is not 'resume'
-model_name = 'round1_agent1'
+out_dir = 'out-collab_exp5' # ignored if init_from is not 'resume'
+model_name = 'round1_agent1_crosscal'
 meta_file = 'meta1.pkl'
 start = 'FILE:data/majority-mask/input1.txt'
 # start = "7 + 3 + 9 * 1 =" # "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"

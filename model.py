@@ -130,6 +130,8 @@ class GPTConfig:
     cross_multiplier: float = 1.0
     confidence: bool = True
     cross_probabilities: bool = False
+    K: int = 5
+    top_k: int = 1
     causal: bool = True
 
 class GPT(nn.Module):
@@ -224,7 +226,9 @@ class GPT(nn.Module):
             # binary tasks: predictions are probabilities place on token 1
             idx = self.config.stoi["1"]
             predictions = probs[:, :, idx]
-
+        
+        expand_predictions = predictions.unsqueeze(-1).expand(-1, -1, K) # expand to size B x T x K
+       
         if smooth:
             # define soft buckets using Gaussian kernels
             centers = torch.linspace(0, 1, K, device=logits.device, dtype=probs.dtype)
@@ -242,25 +246,79 @@ class GPT(nn.Module):
             left = left.view(1, 1, -1).expand(probs.size(0), probs.size(1), -1) # expand to size B x T x K  
             right = centers[1:] 
             right = right.view(1, 1, -1).expand(probs.size(0), probs.size(1), -1) # expand to size B x T x K
-            for k in range(K):
-                if k == K-1:
-                    # compare each entry predictions[b,t] with left[b,t,k] and right[b,t,k]
-                    weights[:, :, k] = (predictions >= left[:, :, k]) & (predictions <= right[:, :, k])
-                else:
-                    weights[:, :, k] = (predictions >= left[:, :, k]) & (predictions < right[:, :, k])
+            weights = (expand_predictions >= left) & (expand_predictions < right)
+            weights[:, :, -1] = (predictions >= left[:, :, -1]) & (predictions <= right[:, :, -1]) # for last bucket, include right endpoint
 
         if sample_weights is not None:
             weights = weights * sample_weights.unsqueeze(-1)
         S = weights.sum(dim=(0, 1)) # sum of weights for each bucket
 
         p_bar = torch.zeros(K, device=logits.device, dtype=probs.dtype) # mean probability for each bucket
-        for k in range(K):
-            p_bar[k] = ((weights[:, :, k] * predictions).sum()) / S[k] if S[k] > 0 else 0.0
+        p_bar = (weights * expand_predictions).sum(dim=(0, 1)) / S.clamp_min(1e-12)
+
         y_bar = torch.zeros(K, device=logits.device, dtype=probs.dtype) # mean label for each bucket
-        for k in range(K):
-            y_bar[k] = ((weights[:, :, k] * labels).sum()) / S[k] if S[k] > 0 else 0.0
+        expand_labels = labels.unsqueeze(-1).expand(-1, -1, K)
+        y_bar = (weights * expand_labels).sum(dim=(0, 1)) / S.clamp_min(1e-12)
 
         return torch.sum(S * torch.abs(p_bar - y_bar)) / N
+    
+    def ECE_multidim(self, probs, labels, K=5, smooth=False, sigma=0.1, weights_collaborator=None, confidence=True):
+        """
+        Computes ECE loss on probabilities and labels. 
+        If smooth is False, uses ECE loss (K buckets).
+        If smooth is True, uses smooth ECE loss (Gaussian weights centered at K points with std dev sigma).
+        if weights_collaborator is not None, use it to compute cross ECE.
+        """
+        D = probs.size(-1) # dimension (vocab size)
+        N = probs.size(0) * probs.size(1) # number of examples (B*T)
+
+        # max probs is a tensor of size batch size x context size with max_probs[b,t] = max(probs[b,t,:])
+        # max_probs = torch.max(probs, dim=-1)
+        if confidence:
+            # TODO: generalize to multidimensional setting
+            # # sample predictions from probs
+            # sampled_predictions = torch.distributions.Categorical(probs=probs).sample()
+            # # label is 1 if sampled prediction is correct, 0 otherwise
+            # labels = (sampled_predictions == targets)
+            predictions = torch.max(probs, dim=-1).values # use max probabilities as predictions
+        else:
+            # labels are one-hot vectors of targets
+            # labels = torch.zeros(probs.size(0), probs.size(1), D, device=logits.device, dtype=probs.dtype)
+            # labels.scatter_(-1, targets.unsqueeze(-1), 1)
+            predictions = probs
+            num_buckets = K ** D # number of buckets
+              
+        if smooth:
+            # define D-dimensional soft buckets using Gaussian kernels
+            centers_1d = torch.linspace(0, 1, K, device=probs.device, dtype=probs.dtype)
+            grids = torch.meshgrid([centers_1d] * D, indexing="ij")
+            centers = torch.stack(grids, dim=-1).reshape(-1, D)  # shape K^D x D
+            diff = predictions.unsqueeze(-2) - centers.unsqueeze(0).unsqueeze(0)  # shape B x T x K^D x D
+            diff_norm = (torch.pow(diff, 2)).sum(dim=-1)  # shape B x T x K^D; L2 norm squared across D
+            unnorm_weights = torch.exp(- (diff_norm) / (2 * sigma ** 2))
+            weights = unnorm_weights / unnorm_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        else:
+            # define D-dimensional hard buckets using uniform cells
+            edges_1d = torch.linspace(0, 1, K+1, device=probs.device, dtype=probs.dtype)
+            idx_per_coord = torch.bucketize(predictions, edges_1d, right=True)-1 # shape B x T x D: index of 1-dim bucket that prediction[b,t,d] is in
+            idx_per_coord.clamp_(min=0, max=K-1)
+            powers = (K**torch.arange(D, device=probs.device, dtype=torch.int64)) # shape D
+            idx = (idx_per_coord.to(dtype=torch.int64) * powers).sum(dim=-1) # shape B x T: index of D-dim bucket that prediction[b,t] is in
+            weights = F.one_hot(idx, num_classes=num_buckets).to(dtype=probs.dtype)
+
+        if weights_collaborator is not None: # cross ECE buckets are joint buckets of the model and the collaborator
+            joint_weights = weights_collaborator.unsqueeze(-1) * weights.unsqueeze(-2) # shape B x T x K^D x L
+            joint_weights = joint_weights.reshape(probs.size(0), probs.size(1), -1) # flatten to shape B x T x (K^D*L)
+            weights = joint_weights
+
+        S = weights.sum(dim=(0, 1)) # sum of weights for each bucket
+
+        p_bar = (weights.unsqueeze(-1) * predictions.unsqueeze(-2)).sum(dim=(0, 1)) / S.clamp_min(1e-12).unsqueeze(-1)
+        y_bar = (weights.unsqueeze(-1) * labels.unsqueeze(-2)).sum(dim=(0, 1)) / S.clamp_min(1e-12).unsqueeze(-1)
+
+        ece_loss = (S * torch.linalg.norm(p_bar - y_bar, ord=2, dim=-1)).sum() / N
+
+        return ece_loss   
 
     def cross_ECE(self, logits, targets, collaborator_predictions, collaborator_probs=None, K=5, cross_probabilities=False, smooth_collaborator=False, smooth_own=False, sigma=0.1, confidence=True):
         """
@@ -279,6 +337,8 @@ class GPT(nn.Module):
         collaborator_min = collaborator_predictions.min()
         collaborator_max = collaborator_predictions.max()
 
+        expand_collaborator_predictions = collaborator_predictions.unsqueeze(-1).expand(-1, -1, L) # expand to size B x T x L
+
         if smooth_collaborator:
             # define soft buckets using Gaussian kernels
             centers_collaborator = torch.linspace(collaborator_min, collaborator_max, L, device=logits.device, dtype=logits.dtype)
@@ -293,12 +353,8 @@ class GPT(nn.Module):
             right_collaborator = centers_collaborator[1:]
             right_collaborator = right_collaborator.view(1, 1, -1).expand(logits.size(0), logits.size(1), -1)
             weights_collaborator = torch.zeros(logits.size(0), logits.size(1), L, device=logits.device, dtype=logits.dtype)
-            for l in range(L):
-                if l == L-1:
-                    weights_collaborator[:, :, l] = (collaborator_predictions >= left_collaborator[:, :, l]) & (collaborator_predictions <= right_collaborator[:, :, l])
-                else:
-                    weights_collaborator[:, :, l] = (collaborator_predictions >= left_collaborator[:, :, l]) & (collaborator_predictions < right_collaborator[:, :, l])
-            weights_collaborator = weights_collaborator.to(dtype=logits.dtype)
+            weights_collaborator = (expand_collaborator_predictions >= left_collaborator) & (expand_collaborator_predictions < right_collaborator)
+            weights_collaborator[:, :, -1] = (collaborator_predictions >= left_collaborator[:, :, -1]) & (collaborator_predictions <= right_collaborator[:, :, -1]) # for last bucket, include right endpoint
 
         N = logits.size(0) * logits.size(1) # number of examples (B*T)
         cross_ece = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
@@ -311,6 +367,44 @@ class GPT(nn.Module):
             cross_ece = cross_ece + bucket_ece * S_l
 
         return cross_ece / N  
+
+    def cross_ECE_multidim(self, probs, labels, collaborator_predictions, collaborator_probs=None, K=5, cross_probabilities=False, smooth_collaborator=False, smooth_own=False, sigma=0.1, confidence=True):
+        """
+        Computes cross ECE between the model and the collaborator: 
+        sum_{collaborator_predictions/probs} ECE of the model conditional on collaborator's predictions/probs.
+        If cross_probabilities is True, use collaborator's probabilities to compute cross ECE. Otherwise, use predictions.
+        """
+        if cross_probabilities: # use probability vectors
+            D = collaborator_probs.size(-1) # dimension
+            collaborator_predictions = collaborator_probs
+        else: # use predictions (smoothing only makes sense if predictions are continuous/ordered)
+            D = 1
+            # TODO: generalize to multidimensional setting
+            K = len(torch.unique(collaborator_predictions)) # number of unique predictions
+        
+        num_buckets = K**D # number of buckets
+
+        if smooth_collaborator:
+            # define D-dimensional soft buckets using Gaussian kernels
+            centers_1d = torch.linspace(0, 1, K, device=probs.device, dtype=probs.dtype)
+            grids = torch.meshgrid([centers_1d] * D, indexing="ij")
+            centers = torch.stack(grids, dim=-1).reshape(-1, D)  # shape K^D x D
+            diff = collaborator_predictions.unsqueeze(-2) - centers.unsqueeze(0).unsqueeze(0)  # shape B x T x K^D x D
+            diff_norm = (torch.pow(diff, 2)).sum(dim=-1)  # shape B x T x K^D; L2 norm across D
+            unnorm_weights = torch.exp(- (diff_norm) / (2 * sigma ** 2))
+            weights_collaborator = unnorm_weights / unnorm_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12) 
+        else:
+            # define D-dimensional hard buckets using uniform cells
+            edges_1d = torch.linspace(0, 1, K+1, device=probs.device, dtype=probs.dtype)
+            idx_per_coord = torch.bucketize(collaborator_predictions, edges_1d, right=True)-1 # shape B x T x D: index of 1-dim bucket that prediction[b,t,d] is in
+            idx_per_coord.clamp_(min=0, max=K-1)
+            powers = (K**torch.arange(D, device=probs.device, dtype=probs.dtype)) # shape D
+            idx = (idx_per_coord * powers).sum(dim=-1) # shape B x T: index of D-dim bucket that prediction[b,t] is in
+            weights_collaborator = F.one_hot(idx.to(dtype=torch.int64), num_classes=num_buckets) 
+
+        cross_ece_loss = self.ECE_multidim(probs, labels, K=K, smooth=smooth_own, sigma=sigma, weights_collaborator=weights_collaborator, confidence=confidence)
+        
+        return cross_ece_loss         
     
     def brier_score(self, logits, targets):
         """
@@ -341,13 +435,11 @@ class GPT(nn.Module):
         entropy = -torch.sum(probs * torch.log(probs), dim=-1)
         return entropy.mean(dim=(0,1))
 
-    def forward(self, idx, targets=None, collaborator_predictions=None, collaborator_probs=None, confidence=False, cross_probabilities=False, K=5):
+    def forward(self, idx, targets=None, collaborator_predictions=None, collaborator_probs=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-        if confidence is None:
-            confidence = self.config.confidence
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -357,29 +449,49 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x) # shape (b, t, n_embd)
 
-        if targets is not None:
+        if targets is not None: 
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             if self.config.prefix_size > 0: # if we are using a prefix, crop the logits and targets
                 logits = logits[:, self.config.prefix_size:, :]
                 targets = targets[:, self.config.prefix_size:]
-                probs = F.softmax(logits, dim=-1)
-                # probs0 = probs[:,:,1]
-                # probs1 = probs[:,:,2]
-                # print("probs0:", probs0)
-                # print("probs1:", probs1)
+            probs = F.softmax(logits, dim=-1)
+
             # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
-            #loss = 0
-            ece_loss = self.ECE(logits, targets, K=K, smooth=False, confidence=confidence)
-            sm_ece_loss = self.ECE(logits, targets, K=K, smooth=True, confidence=confidence)
+            # loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+            CE_loss = loss
+            
+            # # compute ECE losses on top k predictions and targets
+            # top_k_probs, top_k_indices = torch.topk(probs, k=self.config.top_k, dim=-1, sorted=False)
+            # top_k_labels = (top_k_indices == targets.unsqueeze(-1)) # one-hot label vectors for top k predictions: labels[b,t,i] = 1 iff top_k_indices[b,t,i] == targets[b,t]
+
+            top_k_indices = torch.tensor([1,2], device=logits.device)
+            top_k_probs = torch.index_select(probs, dim=-1, index=top_k_indices) # select 0 and 1 bit
+            top_k_labels = (top_k_indices.unsqueeze(0).unsqueeze(0) == targets.unsqueeze(-1))
+            
+            ece_loss = self.ECE(logits, targets, K=self.config.K, smooth=False, confidence=self.config.confidence)
+            ece_loss_multidim = self.ECE_multidim(top_k_probs, top_k_labels, K=self.config.K, smooth=False, confidence=self.config.confidence)
+            sm_ece_loss = self.ECE(logits, targets, K=self.config.K, smooth=True, confidence=self.config.confidence)
+            sm_ece_loss_multidim = self.ECE_multidim(top_k_probs, top_k_labels, K=self.config.K, smooth=True, confidence=self.config.confidence)
             brier_score = self.brier_score(logits, targets)
             zero_one_loss = self.zero_one_loss(logits, targets)
             
             if collaborator_predictions is not None or collaborator_probs is not None:
+                if collaborator_probs is not None:
+                    # compute cross ECE losses on top k collaborator probabilities
+                    # top_k_collaborator_probs, top_k_collaborator_indices = torch.topk(collaborator_probs, k=self.config.top_k, dim=-1)
+                    top_k_collaborator_probs = torch.index_select(collaborator_probs, dim=-1, index=top_k_indices)
                 # calculate cross calibration error wrt collaborator predictions
-                cross_ece_loss = self.cross_ECE(logits, targets, collaborator_predictions, collaborator_probs, K=K, cross_probabilities=cross_probabilities, smooth_collaborator=False, smooth_own=False, confidence=confidence)
-                sm_cross_ece_loss = self.cross_ECE(logits, targets, collaborator_predictions, collaborator_probs, K=K, cross_probabilities=cross_probabilities, smooth_collaborator=True, smooth_own=True, confidence=confidence)
+                cross_ece_loss = self.cross_ECE(logits, targets, collaborator_predictions, collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=False, smooth_own=False, confidence=self.config.confidence)
+                cross_ece_loss_multidim = self.cross_ECE_multidim(top_k_probs, top_k_labels, collaborator_predictions, top_k_collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=False, smooth_own=False, confidence=self.config.confidence)
+                # print("cross ECE loss:", cross_ece_loss)
+                # print("cross ECE loss multidim:", cross_ece_loss_multidim)
+                sm_cross_ece_loss = self.cross_ECE(logits, targets, collaborator_predictions, collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=True, smooth_own=True, confidence=self.config.confidence)
+                sm_cross_ece_loss_multidim = self.cross_ECE_multidim(top_k_probs, top_k_labels, collaborator_predictions, top_k_collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=True, smooth_own=True, confidence=self.config.confidence)
+                # print("sm cross ECE loss:", sm_cross_ece_loss)
+                # print("sm cross ECE loss multidim:", sm_cross_ece_loss_multidim)
+                # print("--------------------------------")
                 # if cross_ece_loss + 1e-6 < ece_loss:
                 #     print("self ECE loss:", ece_loss)
                 #     print("cross ECE loss:", cross_ece_loss)
@@ -411,14 +523,19 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
+            CE_loss = None
             ece_loss = None
+            ece_loss_multidim = None
             sm_ece_loss = None
+            sm_ece_loss_multidim = None
             cross_ece_loss = None
+            cross_ece_loss_multidim = None
             sm_cross_ece_loss = None
+            sm_cross_ece_loss_multidim = None
             brier_score = None
             zero_one_loss = None
         entropy = self.entropy(logits)
-        return logits, loss, ece_loss, sm_ece_loss, cross_ece_loss, sm_cross_ece_loss, brier_score, zero_one_loss, entropy
+        return logits, CE_loss, loss, ece_loss, ece_loss_multidim, sm_ece_loss, sm_ece_loss_multidim, cross_ece_loss, cross_ece_loss_multidim, sm_cross_ece_loss, sm_cross_ece_loss_multidim, brier_score, zero_one_loss, entropy
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -542,7 +659,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _, _, _, _, _, _, _, _ = self(idx_cond)
+            logits, _, _, _, _, _, _, _, _, _, _, _, _, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
