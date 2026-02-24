@@ -116,6 +116,8 @@ with torch.no_grad():
                         out.write(output.rstrip('\n') + " ")
                         out.write(f"({probs[0][0][1].item()}, {probs[0][0][2].item()})\n")
         else:
+            start_ids = encode(start)
+            x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
             for k in range(num_samples):
                 y = model.generate(x.clone(), max_new_tokens, temperature=temperature, top_k=top_k)
                 # print(decode(y[0].tolist()))

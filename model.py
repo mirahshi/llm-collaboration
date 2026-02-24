@@ -9,7 +9,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -131,6 +131,7 @@ class GPTConfig:
     confidence: bool = True
     cross_probabilities: bool = False
     K: int = 5
+    answer_tokens: list = field(default_factory=lambda: [''])
     top_k: int = 1
     causal: bool = True
 
@@ -447,7 +448,7 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x) # shape (b, t, n_embd)
+        x = self.transformer.ln_f(x) # shape (b, t, n_embd)  
 
         if targets is not None: 
             # if we are given some desired targets also calculate the loss
@@ -465,15 +466,14 @@ class GPT(nn.Module):
             # # compute ECE losses on top k predictions and targets
             # top_k_probs, top_k_indices = torch.topk(probs, k=self.config.top_k, dim=-1, sorted=False)
             # top_k_labels = (top_k_indices == targets.unsqueeze(-1)) # one-hot label vectors for top k predictions: labels[b,t,i] = 1 iff top_k_indices[b,t,i] == targets[b,t]
-
-            top_k_indices = torch.tensor([1,2], device=logits.device)
-            top_k_probs = torch.index_select(probs, dim=-1, index=top_k_indices) # select 0 and 1 bit
-            top_k_labels = (top_k_indices.unsqueeze(0).unsqueeze(0) == targets.unsqueeze(-1))
+            answer_indices = torch.tensor([self.config.stoi[token] for token in self.config.answer_tokens], device=device)
+            answer_probs = torch.index_select(probs, dim=-1, index=answer_indices) # select 0 and 1 bit
+            labels = (answer_indices.unsqueeze(0).unsqueeze(0) == targets.unsqueeze(-1))
             
             ece_loss = self.ECE(logits, targets, K=self.config.K, smooth=False, confidence=self.config.confidence)
-            ece_loss_multidim = self.ECE_multidim(top_k_probs, top_k_labels, K=self.config.K, smooth=False, confidence=self.config.confidence)
+            ece_loss_multidim = self.ECE_multidim(answer_probs, labels, K=self.config.K, smooth=False, confidence=self.config.confidence)
             sm_ece_loss = self.ECE(logits, targets, K=self.config.K, smooth=True, confidence=self.config.confidence)
-            sm_ece_loss_multidim = self.ECE_multidim(top_k_probs, top_k_labels, K=self.config.K, smooth=True, confidence=self.config.confidence)
+            sm_ece_loss_multidim = self.ECE_multidim(answer_probs, labels, K=self.config.K, smooth=True, confidence=self.config.confidence)
             brier_score = self.brier_score(logits, targets)
             zero_one_loss = self.zero_one_loss(logits, targets)
             
@@ -481,14 +481,14 @@ class GPT(nn.Module):
                 if collaborator_probs is not None:
                     # compute cross ECE losses on top k collaborator probabilities
                     # top_k_collaborator_probs, top_k_collaborator_indices = torch.topk(collaborator_probs, k=self.config.top_k, dim=-1)
-                    top_k_collaborator_probs = torch.index_select(collaborator_probs, dim=-1, index=top_k_indices)
+                    collaborator_answer_probs = torch.index_select(collaborator_probs, dim=-1, index=answer_indices)
                 # calculate cross calibration error wrt collaborator predictions
                 cross_ece_loss = self.cross_ECE(logits, targets, collaborator_predictions, collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=False, smooth_own=False, confidence=self.config.confidence)
-                cross_ece_loss_multidim = self.cross_ECE_multidim(top_k_probs, top_k_labels, collaborator_predictions, top_k_collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=False, smooth_own=False, confidence=self.config.confidence)
+                cross_ece_loss_multidim = self.cross_ECE_multidim(answer_probs, labels, collaborator_predictions, collaborator_answer_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=False, smooth_own=False, confidence=self.config.confidence)
                 # print("cross ECE loss:", cross_ece_loss)
                 # print("cross ECE loss multidim:", cross_ece_loss_multidim)
                 sm_cross_ece_loss = self.cross_ECE(logits, targets, collaborator_predictions, collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=True, smooth_own=True, confidence=self.config.confidence)
-                sm_cross_ece_loss_multidim = self.cross_ECE_multidim(top_k_probs, top_k_labels, collaborator_predictions, top_k_collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=True, smooth_own=True, confidence=self.config.confidence)
+                sm_cross_ece_loss_multidim = self.cross_ECE_multidim(answer_probs, labels, collaborator_predictions, collaborator_answer_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=True, smooth_own=True, confidence=self.config.confidence)
                 # print("sm cross ECE loss:", sm_cross_ece_loss)
                 # print("sm cross ECE loss multidim:", sm_cross_ece_loss_multidim)
                 # print("--------------------------------")
@@ -506,6 +506,8 @@ class GPT(nn.Module):
             else:
                 cross_ece_loss = None
                 sm_cross_ece_loss = None
+                cross_ece_loss_multidim = None
+                sm_cross_ece_loss_multidim = None
 
             if self.config.calibrate == 'smECE':
                 if collaborator_predictions is None and collaborator_probs is None:
@@ -648,7 +650,7 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, return_probs=False):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, return_probs=False, sample_from_answers=False):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -669,11 +671,17 @@ class GPT(nn.Module):
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
             probs_list.append(probs)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
+            if sample_from_answers:
+                # sample from only the answer tokens
+                answer_indices = torch.tensor([self.config.stoi[token] for token in self.config.answer_tokens], device=idx.device)
+                probs = torch.index_select(probs, dim=-1, index=answer_indices)
+                idx_next = torch.multinomial(probs, num_samples=1)
+                idx_next = answer_indices[idx_next]
+            else:
+                # sample from the entire distribution
+                idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
-        
         probs_list = torch.stack(probs_list, dim=1)
         if return_probs:
             return idx, probs_list

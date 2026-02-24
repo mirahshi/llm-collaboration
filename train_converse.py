@@ -23,6 +23,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import ast
 
 import numpy as np
 import torch
@@ -30,6 +31,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from prepare import prepare
 import wandb
 from termcolor import colored
 
@@ -70,6 +72,7 @@ cross_multiplier = 1 # multiplier for cross calibration loss
 confidence = False # use confidence calibration; otherwise use probability calibration
 cross_probabilities = True # use collaborator's probabilities for cross calibration
 K = 5 # number of buckets for (cross) ECE
+answer_tokens = ['0', '1'] # possible answer tokens
 top_k = 1 # number of top k predictions to use for ECE losses
 # model
 n_layer = 12
@@ -159,23 +162,27 @@ class Agent():
             print(f"found agent {self.id} vocab_size = {self.meta_vocab_size} (inside {meta_path})")
             print(f"agent {self.id} stoi: {self.meta_stoi}")
             print(f"agent {self.id} itos: {self.meta_itos}")
+            self.encode = lambda s: [self.meta_stoi[c] for c in s]
+            self.decode = lambda l: ''.join([self.meta_itos[i] for i in l])
 
         # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
         self.iter_num = 0
         self.best_val_loss = 1e9
-        self.base_prefix_size = self.config['prefix_size']
-        self.base_block_size = self.config['block_size']
+        self.prefix_size = self.config['prefix_size']
+        self.block_size = self.config['block_size']
+        self.example_size = self.config['example_size']
+
+        # update prefix size, block size, and example size if collaborator model is used
+        if self.collaborator_model is not None:
+            self.prefix_size = self.config['prefix_size'] + 1
+            self.block_size = self.config['block_size'] + 1
+            self.example_size = self.config['example_size'] + 1
 
         # model init
-        self.model_args = dict(n_layer=self.config['n_layer'], n_head=self.config['n_head'], n_embd=self.config['n_embd'], block_size=self.config['block_size'],
-                        bias=self.config['bias'], vocab_size=None, stoi=self.meta_stoi, itos=self.meta_itos, dropout=self.config['dropout'], prefix_size=self.config['prefix_size'], example_size=self.config['example_size'], calibrate=self.config['calibrate'], multiplier=self.config['multiplier'], 
-                        cross_calibrate=self.config['cross_calibrate'], cross_multiplier=self.config['cross_multiplier'], confidence=self.config['confidence'], causal=self.config['causal'], cross_probabilities=self.config['cross_probabilities'], K=self.config['K'], top_k=self.config['top_k']) # start with model_args from command line
-        # update prefix size and block size if collaborator model is used
-        if self.collaborator_model is not None:
-            self.config['prefix_size'] += 1
-            self.config['block_size'] += 1
-            self.model_args['prefix_size'] = self.config['prefix_size']
-            self.model_args['block_size'] = self.config['block_size']
+        self.model_args = dict(n_layer=self.config['n_layer'], n_head=self.config['n_head'], n_embd=self.config['n_embd'], block_size=self.block_size,
+                        bias=self.config['bias'], vocab_size=None, stoi=self.meta_stoi, itos=self.meta_itos, dropout=self.config['dropout'], prefix_size=self.prefix_size, example_size=self.example_size, calibrate=self.config['calibrate'], multiplier=self.config['multiplier'], 
+                        cross_calibrate=self.config['cross_calibrate'], cross_multiplier=self.config['cross_multiplier'], confidence=self.config['confidence'], causal=self.config['causal'], cross_probabilities=self.config['cross_probabilities'], K=self.config['K'], top_k=self.config['top_k'], answer_tokens=self.config['answer_tokens']) # start with model_args from command line
+
         
         if self.config['init_from'] == 'scratch':
             # init a new model from scratch
@@ -217,10 +224,10 @@ class Agent():
             # read off the created config params, so we can store them into checkpoint correctly
             for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'prefix_size', 'causal', 'example_size']:
                 self.model_args[k] = getattr(self.model.config, k)
-        # crop down the model block size if desired, using model surgery
-        if self.config['block_size'] < self.model.config.block_size:
-            self.model.crop_block_size(self.config['block_size'])
-            self.model_args['block_size'] = self.config['block_size'] # so that the checkpoint will have the right value
+        # # crop down the model block size if desired, using model surgery
+        # if self.config['block_size'] < self.model.config.block_size:
+        #     self.model.crop_block_size(self.config['block_size'])
+        #     self.model_args['block_size'] = self.config['block_size'] # so that the checkpoint will have the right value
         self.model.to(self.config['device'])
 
         # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -246,37 +253,97 @@ class Agent():
     def get_batch(self, split):
         # We recreate np.memmap every batch to avoid a memory leak, as per
         # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+        file_name_suffix = f'{self.id}_round{self.round}'
         if split == 'train':
-            data = np.memmap(os.path.join(self.data_dir, f'train{self.id}.bin'), dtype=np.uint16, mode='r')
+            data = np.memmap(os.path.join(self.data_dir, f'train{file_name_suffix}.bin'), dtype=np.uint16, mode='r')
         else:
-            data = np.memmap(os.path.join(self.data_dir, f'val{self.id}.bin'), dtype=np.uint16, mode='r')
+            data = np.memmap(os.path.join(self.data_dir, f'val{file_name_suffix}.bin'), dtype=np.uint16, mode='r')
         # ix = torch.randint(len(data) - block_size, (batch_size,))
-        # ix is multiples of example_size and has batch size batch_size
-        starting_indices = torch.arange(0, len(data), example_size)
-        ix = torch.randint(len(starting_indices), (self.config['batch_size'],))
-        ix = starting_indices[ix]
-        x = torch.stack([torch.from_numpy((data[i:i+self.base_block_size]).astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy((data[i+1:i+1+self.base_block_size]).astype(np.int64)) for i in ix])
+        # ix_examples is randomly sampled example numbers in the batch
+        # ix is the starting indices of the examples in the batch (ix is multiples of example_size)
+        starting_indices = torch.arange(0, len(data), self.example_size)
+        ix_examples = torch.randint(len(starting_indices), (self.config['batch_size'],))
+        ix = starting_indices[ix_examples]
+        x = torch.stack([torch.from_numpy((data[i:i+self.block_size]).astype(np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy((data[i+1:i+1+self.block_size]).astype(np.int64)) for i in ix])
         if self.config['device'] == 'cuda':
             # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
             x, y = x.pin_memory().to(self.config['device'], non_blocking=True), y.pin_memory().to(self.config['device'], non_blocking=True)
         else:
             x, y = x.to(self.config['device']), y.to(self.config['device'])
-        # if collaborator is True, get x batch (same indices) for collaborator model
-        if self.collaborator_model is not None:
-            if split == 'train':
-                collaborator_data = np.memmap(os.path.join(self.data_dir, f'train{self.collaborator_id}.bin'), dtype=np.uint16, mode='r')
-            else:
-                collaborator_data = np.memmap(os.path.join(self.data_dir, f'val{self.collaborator_id}.bin'), dtype=np.uint16, mode='r')
-            collaborator_x = torch.stack([torch.from_numpy((collaborator_data[i:i+self.base_block_size]).astype(np.int64)) for i in ix])
-            if self.config['device'] == 'cuda':
-                collaborator_x = collaborator_x.pin_memory().to(self.config['device'], non_blocking=True)
-            else:
-                collaborator_x = collaborator_x.to(self.config['device'])
-        else:
-            collaborator_x = None
-        return x, y, collaborator_x
 
+        # if collaborator is True, get collaborator probabilities (stored in input file)
+        if self.collaborator_model is not None:
+            input_file = os.path.join(self.data_dir, f'input{file_name_suffix}.txt')
+            collaborator_probs_list = []
+            with open(input_file, 'r') as f:
+                lines = f.readlines()
+                for i in ix_examples:
+                    line = lines[i].rstrip('\n')
+                    line = line.split(',')
+                    probs = line[1:]
+                    probs = ','.join(probs)
+                    probs = ast.literal_eval(probs)
+                    collaborator_probs_list.append(probs)                       
+            collaborator_probs = torch.tensor(collaborator_probs_list, device=self.config['device'], dtype=torch.float32)
+            collaborator_probs = collaborator_probs.unsqueeze(1) # shape (B, 1, V)
+        else:
+            collaborator_probs = None  
+        
+        # # if collaborator is True, get x batch (same indices) for collaborator model
+        # if self.collaborator_model is not None:
+        #     if split == 'train':
+        #         collaborator_data = np.memmap(os.path.join(self.data_dir, f'train{self.collaborator_id}.bin'), dtype=np.uint16, mode='r')
+        #     else:
+        #         collaborator_data = np.memmap(os.path.join(self.data_dir, f'val{self.collaborator_id}.bin'), dtype=np.uint16, mode='r')
+        #     collaborator_x = torch.stack([torch.from_numpy((collaborator_data[i:i+self.base_block_size]).astype(np.int64)) for i in ix])
+        #     if self.config['device'] == 'cuda':
+        #         collaborator_x = collaborator_x.pin_memory().to(self.config['device'], non_blocking=True)
+        #     else:
+        #         collaborator_x = collaborator_x.to(self.config['device'])
+        # else:
+        #     collaborator_x = None
+        return x, y, collaborator_probs
+
+    def label_dataset(self, input_path, label_path, output_path):
+        """
+        Label dataset specified by label_path by appending predictions generated by the model on inputs in input_path.
+        The labelled dataset is saved to output_path.
+        """
+        with open(output_path, 'w') as f:
+                pass
+        with open(input_path, 'r', encoding='utf-8') as f_input, open(label_path, 'r', encoding='utf-8') as f_label:
+            for i, (input_line, label_line) in enumerate(zip(f_input, f_label)):
+                # generate prediction for input line
+                start = input_line[:self.block_size]
+                start_ids = self.encode(start)
+                x = (torch.tensor(start_ids, dtype=torch.long, device=self.config['device'])[None, ...])
+                y, probs = self.model.generate(x.clone(), max_new_tokens=1, return_probs=True, sample_from_answers=True)
+                # crop outputs to retrieve only the answer token
+                y = y[:, self.block_size:]
+                prediction = self.decode(y[0].tolist())
+
+                with open(output_path, "a", encoding="utf-8") as out:
+                    # append output to the beginning of the example
+                    prediction = prediction.rstrip('\n')
+                    # if model predicted '\n', prediction is now empty;
+                    # fall back to the most likely valid answer token to
+                    # keep every output line the same length (otherwise
+                    # get_batch starting_indices will be misaligned)
+                    if prediction not in self.config['answer_tokens']:
+                        print("prediction not in answer tokens: ", prediction)
+                        answer_indices = [self.meta_stoi[t] for t in self.config['answer_tokens']]
+                        answer_probs = probs[0, 0, answer_indices]
+                        best = answer_probs.argmax().item()
+                        prediction = self.config['answer_tokens'][best]
+                        print("new prediction: ", prediction)
+                    label_line = label_line.rstrip('\n')
+                    # write prediction+example, probabilities to output file
+                    out.write(f"{prediction}{label_line}, {probs[0][0].tolist()}\n")
+        next_agent_id = (self.id + 1) % self.config['num_agents']
+        file_name_suffix = f'{next_agent_id}_round{self.round+1}'
+        prepare(output_path, file_name_suffix)
+    
     def get_collaborator_predictions(self, collaborator_x):
         with self.ctx:
             # get predictions and probabilities of collaborator model on inputs (no grad)
@@ -312,13 +379,14 @@ class Agent():
             zero_one_losses = torch.zeros(self.config['eval_iters'])
             entropies = torch.zeros(self.config['eval_iters'])
             for k in range(self.config['eval_iters']):
-                X, Y, collaborator_X = self.get_batch(split)
-                if self.collaborator_model is not None: # get collaborator predictions and append to x
-                    collaborator_predictions, collaborator_probs = self.get_collaborator_predictions(collaborator_X)
-                    X, Y = self.append_collaborator_predictions(X, Y, collaborator_predictions)
-                else:
-                    collaborator_predictions = None
-                    collaborator_probs = None
+                X, Y, collaborator_probs = self.get_batch(split)
+                collaborator_predictions = None
+                # if self.collaborator_model is not None: # get collaborator predictions and append to x
+                #     collaborator_predictions, collaborator_probs = self.get_collaborator_predictions(collaborator_X)
+                #     X, Y = self.append_collaborator_predictions(X, Y, collaborator_predictions)
+                # else:
+                #     collaborator_predictions = None
+                #     collaborator_probs = None
                 with self.ctx:
                     logits, CE_loss, loss, ece_loss, ece_loss_multidim, sm_ece_loss, sm_ece_loss_multidim, cross_ece_loss, cross_ece_loss_multidim, sm_cross_ece_loss, sm_cross_ece_loss_multidim, brier_score, zero_one_loss, entropy = self.model(X, Y, collaborator_predictions, collaborator_probs) # call foward function
                 CE_losses[k] = CE_loss.item()
@@ -368,13 +436,14 @@ class Agent():
 
     def train(self):
         # training loop
-        X, Y, collaborator_X = self.get_batch('train') # fetch the very first batch
-        if self.collaborator_model is not None: # get collaborator predictions and append to x
-            collaborator_predictions, collaborator_probs = self.get_collaborator_predictions(collaborator_X)
-            X, Y = self.append_collaborator_predictions(X, Y, collaborator_predictions)
-        else:
-            collaborator_predictions = None
-            collaborator_probs = None
+        X, Y, collaborator_probs = self.get_batch('train') # fetch the very first batch
+        collaborator_predictions = None
+        # if self.collaborator_model is not None: # get collaborator predictions and append to x
+        #     collaborator_predictions, collaborator_probs = self.get_collaborator_predictions(collaborator_X)
+        #     X, Y = self.append_collaborator_predictions(X, Y, collaborator_predictions)
+        # else:
+        #     collaborator_predictions = None
+        #     collaborator_probs = None
         t0 = time.time()
         local_iter_num = 0 # number of iterations in the lifetime of this process
         raw_model = self.model.module if self.ddp else self.model # unwrap DDP container if needed
@@ -440,20 +509,6 @@ class Agent():
                         }
                         print(f"saving checkpoint to {self.config['out_dir']}")
                         torch.save(checkpoint, os.path.join(self.config['out_dir'], f'ckpt_round{self.round}.pt'))
-            if self.master_process and self.config['save_models']:    
-                if self.iter_num == self.config['max_iters']:
-                    # save current model
-                    checkpoint = {
-                            'model': raw_model.state_dict(),
-                            'optimizer': self.optimizer.state_dict(),
-                            'model_args': self.model_args,
-                            'iter_num': self.iter_num,
-                            'best_val_loss': self.best_val_loss,
-                            'config': config,
-                        }
-                    save_path = os.path.join(self.config['out_dir'], f'ckpt_round{self.round}_agent{self.id}{self.config['save_name_suffix']}.pt')
-                    torch.save(checkpoint, save_path)
-                    print(colored(f"saved round {self.round} agent {self.id} checkpoint to {save_path}", 'light_green'))
             if self.iter_num == 0 and self.config['eval_only']:
                 break
 
@@ -470,13 +525,14 @@ class Agent():
                     logits, CE_loss, loss, ece_loss, ece_loss_multidim, sm_ece_loss, sm_ece_loss_multidim, cross_ece_loss, cross_ece_loss_multidim, sm_cross_ece_loss, sm_cross_ece_loss_multidim, brier_score, zero_one_loss, entropy = self.model(X, Y, collaborator_predictions, collaborator_probs)
                     loss = loss / self.config['gradient_accumulation_steps'] # scale the loss to account for gradient accumulation
                 # immediately async prefetch next batch while model is doing the forward pass on the GPU
-                X, Y, collaborator_X = self.get_batch('train')
-                if self.collaborator_model is not None: # get collaborator predictions and append to x
-                    collaborator_predictions, collaborator_probs = self.get_collaborator_predictions(collaborator_X)
-                    X, Y = self.append_collaborator_predictions(X, Y, collaborator_predictions)
-                else:
-                    collaborator_predictions = None
-                    collaborator_probs = None
+                X, Y, collaborator_probs = self.get_batch('train')
+                collaborator_predictions = None
+                # if self.collaborator_model is not None: # get collaborator predictions and append to x
+                #     collaborator_predictions, collaborator_probs = self.get_collaborator_predictions(collaborator_X)
+                #     X, Y = self.append_collaborator_predictions(X, Y, collaborator_predictions)
+                # else:
+                #     collaborator_predictions = None
+                #     collaborator_probs = None
                 # backward pass, with gradient scaling if training in fp16
                 self.scaler.scale(loss).backward()
             # clip the gradient
@@ -504,6 +560,31 @@ class Agent():
             self.iter_num += 1
             local_iter_num += 1
 
+            # save on last iteration
+            if self.master_process and self.config['save_models']:    
+                if self.iter_num == self.config['max_iters']:
+                    # save current model
+                    checkpoint = {
+                            'model': raw_model.state_dict(),
+                            'optimizer': self.optimizer.state_dict(),
+                            'model_args': self.model_args,
+                            'iter_num': self.iter_num,
+                            'best_val_loss': self.best_val_loss,
+                            'config': config,
+                        }
+                    save_path = os.path.join(self.config['out_dir'], f'ckpt_round{self.round}_agent{self.id}{self.config['save_name_suffix']}.pt')
+                    torch.save(checkpoint, save_path)
+                    print(colored(f"saved round {self.round} agent {self.id} checkpoint to {save_path}", 'light_green'))
+            
+            # label dataset for next round on last iteration
+            if self.iter_num == self.config['max_iters']:
+                next_agent_id = (self.id + 1) % config['num_agents']
+                input_path = os.path.join(self.data_dir, f'input{self.id}_round{self.round}.txt')
+                label_path = os.path.join(self.data_dir, f'input{next_agent_id}_round{0}.txt') # label on original dataset
+                output_path = os.path.join(self.data_dir, f'input{next_agent_id}_round{self.round+1}.txt')
+                self.label_dataset(input_path, label_path, output_path)
+                print(colored(f"created labeled dataset for round {self.round+1} agent {next_agent_id} =================================================", 'light_green'))
+            
             # termination conditions
             if self.iter_num > self.config['max_iters']:
                 break

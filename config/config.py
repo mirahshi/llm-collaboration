@@ -1,7 +1,7 @@
 
 num_agents = 2
-num_rounds = 2
-start_from_round = 1 # which round to start from (begins at 0) 
+num_rounds = 3
+start_from_round = 0 # which round to start from (begins at 0) 
 save_models = False # save models after each round
 save_name_suffix = ''
 # save_name_suffix = '_crosscal' # include suffix for saved model names
@@ -18,13 +18,14 @@ eval_iters = 200
 log_interval = 10 # don't print too too often
 
 # calibrate?
-calibrate = 'smECE' # self-calibrate: None, 'smECE', 'brier'
+calibrate = None # self-calibrate: None, 'smECE', 'brier'
 multiplier = 1 # multiplier for calibration loss
 cross_calibrate = False # cross-calibrate: smECE conditioned on collaborator's predictions
 cross_multiplier = 1 # multiplier for cross calibration loss
 confidence = False # use confidence calibration; otherwise use probability calibration
 cross_probabilities = True # use collaborator's probabilities for cross calibration
-K = 3 # number of buckets for (cross) ECE
+K = 5 # number of buckets for (cross) ECE
+answer_tokens = ['0', '1'] # possible answer tokens
 top_k = 2 # number of top k predictions to use for ECE losses
 
 # we expect to overfit on this small dataset, so only save when val improves
@@ -36,16 +37,17 @@ if calibrate is not None:
 if cross_calibrate: 
     wandb_run_name = wandb_run_name + f'crossK{K}x{cross_multiplier}'
 
-# get prefix size from input.txt
+# get prefix size and answer length from input.txt
 dataset = datasets[0] # ASSUMING BOTH AGENTS' TASKS ARE IN THE SAME FORMAT
-with open(f'data/{dataset}/input0.txt', 'r') as f:
+with open(f'data/{dataset}/input0_round0.txt', 'r') as f:
     lines = f.readlines()
     example_size = len(lines[0].split('\n')[0]) + 1 # number of characters in the input example (including '\n')
     prefix_size = len(lines[0].split('=')[0]) # number of characters in the input before the '='
+    print("example size:", example_size)
     print("prefix_size:", prefix_size)
 # check that the prefix size is the same for all agents
 for idx in range(num_agents):
-    with open(f'data/{dataset}/input{idx}.txt', 'r') as f:
+    with open(f'data/{dataset}/input{idx}_round0.txt', 'r') as f:
         lines = f.readlines()
         if len(lines[0].split('=')[0]) != prefix_size:
             raise ValueError(f"Prefix size for {dataset} is not the same as the first dataset")
@@ -62,7 +64,7 @@ dropout = 0.0 # 0.2
 causal = True
 
 learning_rate = 3e-5 # 1e-4 # 1e-3 # with baby networks can afford to go a bit higher
-max_iters = 10000
+max_iters = 200# 10000
 lr_decay_iters = 40000 # make equal to max_iters usually
 min_lr = 1e-4 # learning_rate / 10 usually
 beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
