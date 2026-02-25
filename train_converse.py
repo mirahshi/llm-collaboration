@@ -55,7 +55,6 @@ num_agents = 1 # 1 or 2
 num_rounds = 1 # number of rounds of conversation
 start_from_round = 0 # start from round 
 save_models = False # save models after each round
-save_name_suffix = '' # specify suffix for saved model names
 # data
 datasets = ['openwebtext'] * num_agents # one dataset per agent
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -149,7 +148,8 @@ class Agent():
 
         self.data_dir = os.path.join('data', self.config['datasets'][id])
         # attempt to derive vocab_size and char-to-int mapping from the dataset
-        meta_path = os.path.join(self.data_dir, f'meta{self.id}.pkl')
+        # meta_path = os.path.join(self.data_dir, f'meta{self.id}.pkl')
+        meta_path = os.path.join(self.config['out_dir'], f'meta{self.id}_round{self.round}.pkl')
         self.meta_vocab_size = None
         self.meta_stoi = None
         self.meta_itos = None
@@ -253,11 +253,14 @@ class Agent():
     def get_batch(self, split):
         # We recreate np.memmap every batch to avoid a memory leak, as per
         # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+
+        data_dir = self.config['out_dir']
         file_name_suffix = f'{self.id}_round{self.round}'
+        
         if split == 'train':
-            data = np.memmap(os.path.join(self.data_dir, f'train{file_name_suffix}.bin'), dtype=np.uint16, mode='r')
+            data = np.memmap(os.path.join(data_dir, f'train{file_name_suffix}.bin'), dtype=np.uint16, mode='r')
         else:
-            data = np.memmap(os.path.join(self.data_dir, f'val{file_name_suffix}.bin'), dtype=np.uint16, mode='r')
+            data = np.memmap(os.path.join(data_dir, f'val{file_name_suffix}.bin'), dtype=np.uint16, mode='r')
         # ix = torch.randint(len(data) - block_size, (batch_size,))
         # ix_examples is randomly sampled example numbers in the batch
         # ix is the starting indices of the examples in the batch (ix is multiples of example_size)
@@ -274,12 +277,20 @@ class Agent():
 
         # if collaborator is True, get collaborator probabilities (stored in input file)
         if self.collaborator_model is not None:
-            input_file = os.path.join(self.data_dir, f'input{file_name_suffix}.txt')
+            if self.round == 0:
+                data_dir = self.data_dir
+            input_file = os.path.join(data_dir, f'input{file_name_suffix}.txt')
             collaborator_probs_list = []
             with open(input_file, 'r') as f:
                 lines = f.readlines()
                 for i in ix_examples:
-                    line = lines[i].rstrip('\n')
+                    if split == 'train':
+                        line = lines[i].rstrip('\n')
+                    else:
+                        # use split from prepare.py
+                        n_examples = len(lines)
+                        split_idx = int(n_examples*0.9)
+                        line = lines[split_idx+i].rstrip('\n')
                     line = line.split(',')
                     probs = line[1:]
                     probs = ','.join(probs)
@@ -572,16 +583,19 @@ class Agent():
                             'best_val_loss': self.best_val_loss,
                             'config': config,
                         }
-                    save_path = os.path.join(self.config['out_dir'], f'ckpt_round{self.round}_agent{self.id}{self.config['save_name_suffix']}.pt')
+                    save_path = os.path.join(self.config['out_dir'], f'ckpt_round{self.round}_agent{self.id}.pt')
                     torch.save(checkpoint, save_path)
                     print(colored(f"saved round {self.round} agent {self.id} checkpoint to {save_path}", 'light_green'))
             
             # label dataset for next round on last iteration
             if self.iter_num == self.config['max_iters']:
                 next_agent_id = (self.id + 1) % config['num_agents']
-                input_path = os.path.join(self.data_dir, f'input{self.id}_round{self.round}.txt')
+                if self.round == 0:
+                    input_path = os.path.join(self.data_dir, f'input{self.id}_round{self.round}.txt')
+                else:
+                    input_path = os.path.join(self.config['out_dir'], f'input{self.id}_round{self.round}.txt')
                 label_path = os.path.join(self.data_dir, f'input{next_agent_id}_round{0}.txt') # label on original dataset
-                output_path = os.path.join(self.data_dir, f'input{next_agent_id}_round{self.round+1}.txt')
+                output_path = os.path.join(self.config['out_dir'], f'input{next_agent_id}_round{self.round+1}.txt')
                 self.label_dataset(input_path, label_path, output_path)
                 print(colored(f"created labeled dataset for round {self.round+1} agent {next_agent_id} =================================================", 'light_green'))
             
@@ -594,7 +608,7 @@ class Agent():
 
 def load_model(round, agent_id):
     """Load a saved round/agent checkpoint as a ready-to-use collaborator model."""
-    ckpt_path = os.path.join(config['out_dir'], f'ckpt_round{round}_agent{agent_id}{config['save_name_suffix']}.pt')
+    ckpt_path = os.path.join(config['out_dir'], f'ckpt_round{round}_agent{agent_id}.pt')
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 

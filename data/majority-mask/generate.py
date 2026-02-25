@@ -27,10 +27,10 @@ def generate_majority(num_examples, num_bits, num_mask):
         
     
     # save the examples to a file
-    with open("data/majority-mask/input0.txt", "w") as f:
+    with open("data/majority-mask/input0_round0.txt", "w") as f:
         for example in examples0:
             f.write(example + "\n")
-    with open("data/majority-mask/input1.txt", "w") as f:
+    with open("data/majority-mask/input1_round0.txt", "w") as f:
         for example in examples1:
             f.write(example + "\n")
     

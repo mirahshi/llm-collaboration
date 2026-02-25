@@ -10,7 +10,8 @@ import requests
 import numpy as np
 import sys
 from termcolor import colored
-from config.config import datasets
+from config.config import datasets, out_dir
+
 
 def prepare(input_file_path, file_name_suffix=''):
     print(colored(f"input file: {input_file_path}", 'blue'))
@@ -59,11 +60,11 @@ def prepare(input_file_path, file_name_suffix=''):
     train_ids = np.array(train_ids, dtype=np.uint16)
     val_ids = np.array(val_ids, dtype=np.uint16)
 
-    save_dir = os.path.join(os.path.dirname(__file__), f'data/{datasets[0]}')
+    os.makedirs(out_dir, exist_ok=True)
 
-    train_ids.tofile(os.path.join(save_dir, f'train{file_name_suffix}.bin'))
-    val_ids.tofile(os.path.join(save_dir, f'val{file_name_suffix}.bin'))
-    print(colored(f"saved train and val datasets to {os.path.join(save_dir, f'train{file_name_suffix}.bin')} and {os.path.join(save_dir, f'val{file_name_suffix}.bin')}", 'light_blue'))
+    train_ids.tofile(os.path.join(out_dir, f'train{file_name_suffix}.bin'))
+    val_ids.tofile(os.path.join(out_dir, f'val{file_name_suffix}.bin'))
+    print(colored(f"saved train and val datasets to {os.path.join(out_dir, f'train{file_name_suffix}.bin')} and {os.path.join(out_dir, f'val{file_name_suffix}.bin')}", 'light_blue'))
 
     # save the meta information as well, to help us encode/decode later
     meta = {
@@ -71,10 +72,13 @@ def prepare(input_file_path, file_name_suffix=''):
         'itos': itos,
         'stoi': stoi,
     }
-    with open(os.path.join(os.path.dirname(__file__), f'data/{datasets[0]}/meta{file_name_suffix}.pkl'), 'wb') as f:
+    with open(os.path.join(out_dir, f'meta{file_name_suffix}.pkl'), 'wb') as f:
         pickle.dump(meta, f)
 
 
 if __name__ == "__main__":
-    input_file = 'data/majority-mask/input1_round1.txt'
-    prepare(input_file, '1_round1')
+    data_dir = os.path.join('data', datasets[0])
+    input_file0 = os.path.join(data_dir, 'input0_round0.txt')
+    input_file1 = os.path.join(data_dir, 'input1_round0.txt')
+    prepare(input_file0, '0_round0')
+    prepare(input_file1, '1_round0')

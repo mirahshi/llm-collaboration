@@ -1,24 +1,23 @@
-
 num_agents = 2
-num_rounds = 3
+num_rounds = 4
 start_from_round = 0 # which round to start from (begins at 0) 
-save_models = False # save models after each round
-save_name_suffix = ''
-# save_name_suffix = '_crosscal' # include suffix for saved model names
+save_models = True # save models after each round
+out_dir_suffix = 'cal'
 
 datasets = ['majority-mask'] * num_agents
 
 wandb_log = True # override via command line if you like
 wandb_project = 'parity'
-wandb_group_name = 'collab_exp5'
+wandb_group_name = 'collab_exp6'
 
-out_dir = f'out-{wandb_group_name}'
+out_dir = f'out-{wandb_group_name}/{out_dir_suffix}'
+
 eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 10 # don't print too too often
 
 # calibrate?
-calibrate = None # self-calibrate: None, 'smECE', 'brier'
+calibrate = 'smECE' # self-calibrate: None, 'smECE', 'brier'
 multiplier = 1 # multiplier for calibration loss
 cross_calibrate = False # cross-calibrate: smECE conditioned on collaborator's predictions
 cross_multiplier = 1 # multiplier for cross calibration loss
@@ -43,8 +42,8 @@ with open(f'data/{dataset}/input0_round0.txt', 'r') as f:
     lines = f.readlines()
     example_size = len(lines[0].split('\n')[0]) + 1 # number of characters in the input example (including '\n')
     prefix_size = len(lines[0].split('=')[0]) # number of characters in the input before the '='
-    print("example size:", example_size)
-    print("prefix_size:", prefix_size)
+    print("config example size:", example_size)
+    print("config prefix_size:", prefix_size)
 # check that the prefix size is the same for all agents
 for idx in range(num_agents):
     with open(f'data/{dataset}/input{idx}_round0.txt', 'r') as f:
@@ -64,7 +63,7 @@ dropout = 0.0 # 0.2
 causal = True
 
 learning_rate = 3e-5 # 1e-4 # 1e-3 # with baby networks can afford to go a bit higher
-max_iters = 200# 10000
+max_iters = 10000
 lr_decay_iters = 40000 # make equal to max_iters usually
 min_lr = 1e-4 # learning_rate / 10 usually
 beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
