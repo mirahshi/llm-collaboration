@@ -200,6 +200,7 @@ def generate_samples(
     all_paths: bool = False,
     path_format: str = "directions",
     seed: int | None = None,
+    mask: bool = True
 ) -> Iterator[dict]:
     """Yield dicts with keys: maze, m1, m2, paths, samples.
 
@@ -219,7 +220,10 @@ def generate_samples(
         s = rng_seed.randint(0, 2**31)
         grid = generate_maze(width, height, wall_density, seed=s)
         paths = find_paths(grid, width, height, all_paths=all_paths)
-        m1, m2 = mask_maze(grid, width, height, seed=s + 1)
+        if mask:
+            m1, m2 = mask_maze(grid, width, height, seed=s + 1)
+        else:
+            m1, m2 = grid, grid
 
         maze_flat = grid_to_flat(grid)
         m1_flat = grid_to_flat(m1)

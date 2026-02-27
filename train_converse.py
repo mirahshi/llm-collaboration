@@ -72,7 +72,6 @@ confidence = False # use confidence calibration; otherwise use probability calib
 cross_probabilities = True # use collaborator's probabilities for cross calibration
 K = 5 # number of buckets for (cross) ECE
 answer_tokens = ['0', '1'] # possible answer tokens
-top_k = 1 # number of top k predictions to use for ECE losses
 # model
 n_layer = 12
 n_head = 12
@@ -181,7 +180,7 @@ class Agent():
         # model init
         self.model_args = dict(n_layer=self.config['n_layer'], n_head=self.config['n_head'], n_embd=self.config['n_embd'], block_size=self.block_size,
                         bias=self.config['bias'], vocab_size=None, stoi=self.meta_stoi, itos=self.meta_itos, dropout=self.config['dropout'], prefix_size=self.prefix_size, example_size=self.example_size, calibrate=self.config['calibrate'], multiplier=self.config['multiplier'], 
-                        cross_calibrate=self.config['cross_calibrate'], cross_multiplier=self.config['cross_multiplier'], confidence=self.config['confidence'], causal=self.config['causal'], cross_probabilities=self.config['cross_probabilities'], K=self.config['K'], top_k=self.config['top_k'], answer_tokens=self.config['answer_tokens']) # start with model_args from command line
+                        cross_calibrate=self.config['cross_calibrate'], cross_multiplier=self.config['cross_multiplier'], confidence=self.config['confidence'], causal=self.config['causal'], cross_probabilities=self.config['cross_probabilities'], K=self.config['K'], answer_tokens=self.config['answer_tokens']) # start with model_args from command line
 
         
         if self.config['init_from'] == 'scratch':
@@ -377,18 +376,19 @@ class Agent():
         for split in ['train', 'val']:
             losses = torch.zeros(self.config['eval_iters'])
             CE_losses = torch.zeros(self.config['eval_iters'])
-            ece_losses = torch.zeros(self.config['eval_iters'])
+            # ece_losses = torch.zeros(self.config['eval_iters'])
             ece_loss_multidims = torch.zeros(self.config['eval_iters'])
-            sm_ece_losses = torch.zeros(self.config['eval_iters'])
+            # sm_ece_losses = torch.zeros(self.config['eval_iters'])
             sm_ece_loss_multidims = torch.zeros(self.config['eval_iters'])
             if self.collaborator_model is not None:
-                cross_ece_losses = torch.zeros(self.config['eval_iters'])
-                sm_cross_ece_losses = torch.zeros(self.config['eval_iters'])
+                # cross_ece_losses = torch.zeros(self.config['eval_iters'])
+                # sm_cross_ece_losses = torch.zeros(self.config['eval_iters'])
                 cross_ece_loss_multidims = torch.zeros(self.config['eval_iters'])
                 sm_cross_ece_loss_multidims = torch.zeros(self.config['eval_iters'])
             brier_scores = torch.zeros(self.config['eval_iters'])
             zero_one_losses = torch.zeros(self.config['eval_iters'])
             entropies = torch.zeros(self.config['eval_iters'])
+            agreements = torch.zeros(self.config['eval_iters'])
             for k in range(self.config['eval_iters']):
                 X, Y, collaborator_probs = self.get_batch(split)
                 collaborator_predictions = None
@@ -399,32 +399,34 @@ class Agent():
                 #     collaborator_predictions = None
                 #     collaborator_probs = None
                 with self.ctx:
-                    logits, CE_loss, loss, ece_loss, ece_loss_multidim, sm_ece_loss, sm_ece_loss_multidim, cross_ece_loss, cross_ece_loss_multidim, sm_cross_ece_loss, sm_cross_ece_loss_multidim, brier_score, zero_one_loss, entropy = self.model(X, Y, collaborator_predictions, collaborator_probs) # call foward function
+                    logits, CE_loss, loss, ece_loss_multidim, sm_ece_loss_multidim, cross_ece_loss_multidim, sm_cross_ece_loss_multidim, brier_score, zero_one_loss, entropy, agreement = self.model(X, Y, collaborator_predictions, collaborator_probs) # call foward function
                 CE_losses[k] = CE_loss.item()
                 losses[k] = loss.item()
-                ece_losses[k] = ece_loss.item()
+                # ece_losses[k] = ece_loss.item()
                 ece_loss_multidims[k] = ece_loss_multidim.item()
-                sm_ece_losses[k] = sm_ece_loss.item()
+                # sm_ece_losses[k] = sm_ece_loss.item()
                 sm_ece_loss_multidims[k] = sm_ece_loss_multidim.item()
                 if self.collaborator_model is not None:
-                    cross_ece_losses[k] = cross_ece_loss.item()
-                    sm_cross_ece_losses[k] = sm_cross_ece_loss.item()
+                    # cross_ece_losses[k] = cross_ece_loss.item()
+                    # sm_cross_ece_losses[k] = sm_cross_ece_loss.item()
                     cross_ece_loss_multidims[k] = cross_ece_loss_multidim.item()
                     sm_cross_ece_loss_multidims[k] = sm_cross_ece_loss_multidim.item()
+                    agreements[k] = agreement.item()
                 brier_scores[k] = brier_score.item()
                 zero_one_losses[k] = zero_one_loss.item()
                 entropies[k] = entropy.item()
             out[split] = losses.mean()
             out[split + '_CE_loss'] = CE_losses.mean()
-            out[split + '_ece_loss'] = ece_losses.mean()
-            out[split + '_sm_ece_loss'] = sm_ece_losses.mean()
+            # out[split + '_ece_loss'] = ece_losses.mean()
+            # out[split + '_sm_ece_loss'] = sm_ece_losses.mean()
             out[split + '_ece_loss_multidim'] = ece_loss_multidims.mean()
             out[split + '_sm_ece_loss_multidim'] = sm_ece_loss_multidims.mean()
             if self.collaborator_model is not None:
-                out[split + '_cross_ece_loss'] = cross_ece_losses.mean()
-                out[split + '_sm_cross_ece_loss'] = sm_cross_ece_losses.mean()
+                # out[split + '_cross_ece_loss'] = cross_ece_losses.mean()
+                # out[split + '_sm_cross_ece_loss'] = sm_cross_ece_losses.mean()
                 out[split + '_cross_ece_loss_multidim'] = cross_ece_loss_multidims.mean()
                 out[split + '_sm_cross_ece_loss_multidim'] = sm_cross_ece_loss_multidims.mean()
+                out[split + '_agreement'] = agreements.mean()
             out[split + '_brier_score'] = brier_scores.mean()
             out[split + '_zero_one_loss'] = zero_one_losses.mean()
             out[split + '_entropy'] = entropies.mean()
@@ -477,10 +479,10 @@ class Agent():
                         "val/loss": losses['val'],
                         "train/CE_loss": losses['train_CE_loss'],
                         "val/CE_loss": losses['val_CE_loss'],
-                        "train/ece_loss": losses['train_ece_loss'],
-                        "val/ece_loss": losses['val_ece_loss'],
-                        "train/sm_ece_loss": losses['train_sm_ece_loss'],
-                        "val/sm_ece_loss": losses['val_sm_ece_loss'],
+                        # "train/ece_loss": losses['train_ece_loss'],
+                        # "val/ece_loss": losses['val_ece_loss'],
+                        # "train/sm_ece_loss": losses['train_sm_ece_loss'],
+                        # "val/sm_ece_loss": losses['val_sm_ece_loss'],
                         "train/ece_loss_multidim": losses['train_ece_loss_multidim'],
                         "val/ece_loss_multidim": losses['val_ece_loss_multidim'],
                         "train/sm_ece_loss_multidim": losses['train_sm_ece_loss_multidim'],
@@ -496,14 +498,16 @@ class Agent():
                     }
                     if self.collaborator_model is not None:
                         log_data.update({
-                            "train/cross_ece_loss": losses['train_cross_ece_loss'],
-                            "val/cross_ece_loss": losses['val_cross_ece_loss'],
-                            "train/sm_cross_ece_loss": losses['train_sm_cross_ece_loss'],
-                            "val/sm_cross_ece_loss": losses['val_sm_cross_ece_loss'],
+                            # "train/cross_ece_loss": losses['train_cross_ece_loss'],
+                            # "val/cross_ece_loss": losses['val_cross_ece_loss'],
+                            # "train/sm_cross_ece_loss": losses['train_sm_cross_ece_loss'],
+                            # "val/sm_cross_ece_loss": losses['val_sm_cross_ece_loss'],
                             "train/cross_ece_loss_multidim": losses['train_cross_ece_loss_multidim'],
                             "val/cross_ece_loss_multidim": losses['val_cross_ece_loss_multidim'],
                             "train/sm_cross_ece_loss_multidim": losses['train_sm_cross_ece_loss_multidim'],
                             "val/sm_cross_ece_loss_multidim": losses['val_sm_cross_ece_loss_multidim'],
+                            "train/agreement": losses['train_agreement'],
+                            "val/agreement": losses['val_agreement'],
                         })
                     wandb.log(log_data)
 
@@ -533,7 +537,7 @@ class Agent():
                     # looking at the source of that context manager, it just toggles this variable
                     self.model.require_backward_grad_sync = (micro_step == self.config['gradient_accumulation_steps'] - 1)
                 with self.ctx:
-                    logits, CE_loss, loss, ece_loss, ece_loss_multidim, sm_ece_loss, sm_ece_loss_multidim, cross_ece_loss, cross_ece_loss_multidim, sm_cross_ece_loss, sm_cross_ece_loss_multidim, brier_score, zero_one_loss, entropy = self.model(X, Y, collaborator_predictions, collaborator_probs)
+                    logits, CE_loss, loss, ece_loss_multidim, sm_ece_loss_multidim, cross_ece_loss_multidim, sm_cross_ece_loss_multidim, brier_score, zero_one_loss, entropy, agreement = self.model(X, Y, collaborator_predictions, collaborator_probs)
                     loss = loss / self.config['gradient_accumulation_steps'] # scale the loss to account for gradient accumulation
                 # immediately async prefetch next batch while model is doing the forward pass on the GPU
                 X, Y, collaborator_probs = self.get_batch('train')
@@ -596,9 +600,12 @@ class Agent():
                     input_path = os.path.join(self.config['out_dir'], f'input{self.id}_round{self.round}.txt')
                 label_path = os.path.join(self.data_dir, f'input{next_agent_id}_round{0}.txt') # label on original dataset
                 output_path = os.path.join(self.config['out_dir'], f'input{next_agent_id}_round{self.round+1}.txt')
+                start_time = time.time()
                 self.label_dataset(input_path, label_path, output_path)
+                end_time = time.time()
                 print(colored(f"created labeled dataset for round {self.round+1} agent {next_agent_id} =================================================", 'light_green'))
-            
+                print(colored(f"time taken: {end_time - start_time:.2f} seconds", 'light_green'))
+
             # termination conditions
             if self.iter_num > self.config['max_iters']:
                 break

@@ -10,7 +10,8 @@ import requests
 import numpy as np
 import sys
 from termcolor import colored
-from config.config import datasets, out_dir
+
+from config.config_maze import datasets, out_dir
 
 
 def prepare(input_file_path, file_name_suffix=''):
