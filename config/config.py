@@ -1,15 +1,15 @@
 num_agents = 2
 num_rounds = 4
-start_from_round = 1 # which round to start from (begins at 0) 
+start_from_round = 0 # which round to start from (begins at 0) 
 save_models = True # save models after each round
-out_dir_suffix = 'crosscal'
+out_dir_suffix = 'cal'
 
 datasets = ['majority-mask'] * num_agents
 # datasets = ['maze'] * num_agents
 
 wandb_log = True # override via command line if you like
 wandb_project = 'parity'
-wandb_group_name = 'collab_exp6'
+wandb_group_name = 'collab_exp8'
 # wandb_group_name = 'collab_exp7'
 
 out_dir = f'out-{wandb_group_name}/{out_dir_suffix}'
@@ -19,16 +19,15 @@ eval_iters = 200
 log_interval = 10 # don't print too too often
 
 # calibrate?
-calibrate = None # self-calibrate: None, 'smECE', 'brier'
+calibrate = 'smECE' # self-calibrate: None, 'smECE', 'brier'
 multiplier = 1 # multiplier for calibration loss
-cross_calibrate = True # cross-calibrate: smECE conditioned on collaborator's predictions
+cross_calibrate = False # cross-calibrate: smECE conditioned on collaborator's predictions
 cross_multiplier = 20 # multiplier for cross calibration loss
 confidence = False # use confidence calibration; otherwise use probability calibration
 cross_probabilities = True # use collaborator's probabilities for cross calibration
 K = 5 # number of buckets for (cross) ECE
 answer_tokens = ['0', '1'] # possible answer tokens
 # answer_tokens = ['d', 'r', 'u', 'l', '*'] # possible answer tokens
-top_k = 2 # number of top k predictions to use for ECE losses
 
 # we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False
