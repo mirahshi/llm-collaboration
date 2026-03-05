@@ -4,10 +4,11 @@ Generate clean majority examples.
 
 import random
 
-def generate_majority(num_examples, num_bits, num_mask):
+def generate_majority(num_examples, num_bits, num_mask, random_mask=False):
     """
     Generate num_examples examples of num_bits bits with binary answer. 
     For each agent, mask num_mask bits. 
+    If random_mask is True, then the mask is randomly chosen for each example, for each agent.
     """
     examples0 = []
     examples1 = []
@@ -17,8 +18,14 @@ def generate_majority(num_examples, num_bits, num_mask):
         # convert bits to string
         bits_str = ''.join(str(bit) for bit in bits)
         # create example string
-        bits_str0 = bits_str[:-num_mask] + "_" * num_mask
-        bits_str1 = "_" * num_mask + bits_str[num_mask:]
+        if random_mask:
+            mask_indices0 = random.sample(range(num_bits), num_mask)
+            mask_indices1 = random.sample(range(num_bits), num_mask)
+            bits_str0 = ''.join(str(bit) if i not in mask_indices0 else "_" for i, bit in enumerate(bits))
+            bits_str1 = ''.join(str(bit) if i not in mask_indices1 else "_" for i, bit in enumerate(bits))
+        else:
+            bits_str0 = bits_str[:-num_mask] + "_" * num_mask
+            bits_str1 = bits_str[:num_mask] + "_" * num_mask
 
         example0 = f"{bits_str0}={answer}"
         example1 = f"{bits_str1}={answer}"
@@ -35,7 +42,8 @@ def generate_majority(num_examples, num_bits, num_mask):
             f.write(example + "\n")
     
 if __name__ == "__main__":
-    num_examples = 10000
-    num_bits = 15
-    num_mask = 2
-    generate_majority(num_examples, num_bits, num_mask)
+    num_examples = 2000000 #10000
+    num_bits = 30 #15
+    num_mask = 15
+    random_mask = True
+    generate_majority(num_examples, num_bits, num_mask, random_mask)

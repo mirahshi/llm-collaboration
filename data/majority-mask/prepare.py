@@ -11,10 +11,7 @@ import numpy as np
 import sys
 from termcolor import colored
 
-# take list of input files as command line argument
-input_files = sys.argv[1:]
-
-for idx,input_file in enumerate(input_files):
+def prepare(input_file, file_name_suffix=''):
     print(colored(f"input file: {input_file}", 'blue'))
     input_file_path = os.path.join(os.path.dirname(__file__), input_file)
 
@@ -53,8 +50,8 @@ for idx,input_file in enumerate(input_files):
     train_ids = np.array(train_ids, dtype=np.uint16)
     val_ids = np.array(val_ids, dtype=np.uint16)
 
-    train_ids.tofile(os.path.join(os.path.dirname(__file__), f'train{idx}.bin'))
-    val_ids.tofile(os.path.join(os.path.dirname(__file__), f'val{idx}.bin'))
+    train_ids.tofile(os.path.join(os.path.dirname(__file__), f'train{file_name_suffix}.bin'))
+    val_ids.tofile(os.path.join(os.path.dirname(__file__), f'val{file_name_suffix}.bin'))
 
     # save the meta information as well, to help us encode/decode later
     meta = {
@@ -62,12 +59,12 @@ for idx,input_file in enumerate(input_files):
         'itos': itos,
         'stoi': stoi,
     }
-    with open(os.path.join(os.path.dirname(__file__), f'meta{idx}.pkl'), 'wb') as f:
+    with open(os.path.join(os.path.dirname(__file__), f'meta{file_name_suffix}.pkl'), 'wb') as f:
         pickle.dump(meta, f)
 
-# length of dataset in characters:  1115394
-# all the unique characters:
-#  !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
-# vocab size: 65
-# train has 1003854 tokens
-# val has 111540 tokens
+
+if __name__ == "__main__":
+    input_file0 = 'input0_round0.txt'
+    input_file1 = 'input1_round0.txt'
+    prepare(input_file0, '0_round0')
+    prepare(input_file1, '1_round0')

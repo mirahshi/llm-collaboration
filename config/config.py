@@ -1,15 +1,15 @@
 num_agents = 2
 num_rounds = 4
-start_from_round = 0 # which round to start from (begins at 0) 
+start_from_round = 2 # which round to start from (begins at 0) 
 save_models = True # save models after each round
-out_dir_suffix = 'scratch'
+out_dir_suffix = 'base-with-probs'
 
 datasets = ['majority-mask'] * num_agents
 # datasets = ['maze'] * num_agents
 
 wandb_log = True # override via command line if you like
 wandb_project = 'parity'
-wandb_group_name = 'collab_exp9'
+wandb_group_name = 'collab_exp10'
 
 out_dir = f'out-{wandb_group_name}/{out_dir_suffix}'
 
@@ -27,16 +27,18 @@ cross_probabilities = True # use collaborator's probabilities for cross calibrat
 K = 5 # number of buckets for (cross) ECE
 answer_tokens = ['0', '1'] # possible answer tokens
 append_predictions = True # append predictions to output file
-append_probabilities = False # append probabilities to output file
+append_probabilities = True # append probabilities to output file
 
 # we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False
 
 wandb_run_name = ''
 if calibrate is not None:
-    wandb_run_name = wandb_run_name + f'cal-{calibrate}K{K}x{multiplier}'
+    wandb_run_name += f'cal-{calibrate}K{K}x{multiplier}'
 if cross_calibrate: 
-    wandb_run_name = wandb_run_name + f'crossK{K}x{cross_multiplier}'
+    wandb_run_name += f'crossK{K}x{cross_multiplier}'
+if append_probabilities:
+    wandb_run_name += '-with-probs'
 
 # get prefix size and answer length from input.txt
 dataset = datasets[0] # ASSUMING BOTH AGENTS' TASKS ARE IN THE SAME FORMAT
@@ -65,7 +67,7 @@ dropout = 0.0 # 0.2
 causal = True
 
 learning_rate = 1e-4#3e-5 # 1e-4 # 1e-3 # with baby networks can afford to go a bit higher
-max_iters = 10000#20000
+max_iters = 15000#20000
 lr_decay_iters = max_iters # make equal to max_iters usually
 min_lr = learning_rate / 10 # learning_rate / 10 usually
 beta2 = 0.99 # make a bit bigger because number of tokens per iter is small

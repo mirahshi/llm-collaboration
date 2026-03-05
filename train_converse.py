@@ -274,7 +274,7 @@ class Agent():
             t1 = time.time()
             print(f"Time taken for fetching collaborator probabilities: {t1 - t0} seconds")
 
-    def get_batch(self, split):
+    def get_batch(self, split, num_examples=None):
         # We recreate np.memmap every batch to avoid a memory leak, as per
         # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
 
@@ -288,8 +288,10 @@ class Agent():
         # ix = torch.randint(len(data) - block_size, (batch_size,))
         # ix_examples is randomly sampled example numbers in the batch
         # ix is the starting indices of the examples in the batch (ix is multiples of example_size)
+        if num_examples is None:
+            num_examples = self.config['batch_size']
         starting_indices = torch.arange(0, len(data), self.example_size)
-        ix_examples = torch.randint(len(starting_indices), (self.config['batch_size'],))
+        ix_examples = torch.randint(len(starting_indices), (num_examples,))
         ix = starting_indices[ix_examples]
         x = torch.stack([torch.from_numpy((data[i:i+self.block_size]).astype(np.int64)) for i in ix])
         y = torch.stack([torch.from_numpy((data[i+1:i+1+self.block_size]).astype(np.int64)) for i in ix])
@@ -355,34 +357,6 @@ class Agent():
                             output_line = f"{prob_string},{output_line}"
                         out.write(f"{output_line};{prob[0].tolist()}\n")   
                         # out.write(f"{prob[0].tolist()};{prediction};{label_line}\n")
-
-            # for i, (input_line, label_line) in enumerate(zip(f_input, f_label)):
-            #     # generate prediction for input line
-            #     start = input_line[:self.block_size]
-            #     start_ids = self.encode(start)
-            #     x = (torch.tensor(start_ids, dtype=torch.long, device=self.config['device'])[None, ...])
-            #     y, probs = self.model.generate(x.clone(), max_new_tokens=1, return_probs=True, sample_from_answers=True)
-            #     # crop outputs to retrieve only the answer token
-            #     y = y[:, self.block_size:]
-            #     prediction = self.decode(y[0].tolist())
-
-            #     with open(output_path, "a", encoding="utf-8") as out:
-            #         # append output to the beginning of the example
-            #         prediction = prediction.rstrip('\n')
-            #         # if model predicted '\n', prediction is now empty;
-            #         # fall back to the most likely valid answer token to
-            #         # keep every output line the same length (otherwise
-            #         # get_batch starting_indices will be misaligned)
-            #         if prediction not in self.config['answer_tokens']:
-            #             print("prediction not in answer tokens: ", prediction)
-            #             answer_indices = [self.meta_stoi[t] for t in self.config['answer_tokens']]
-            #             answer_probs = probs[0, 0, answer_indices]
-            #             best = answer_probs.argmax().item()
-            #             prediction = self.config['answer_tokens'][best]
-            #             print("new prediction: ", prediction)
-            #         label_line = label_line.rstrip('\n')
-            #         # write prediction+example, probabilities to output file
-            #         out.write(f"{prediction}{label_line}, {probs[0][0].tolist()}\n")
         next_agent_id = (self.id + 1) % self.config['num_agents']
         file_name_suffix = f'{next_agent_id}_round{self.round+1}'
         prepare(output_path, file_name_suffix)
@@ -458,6 +432,25 @@ class Agent():
             out[split + '_brier_score'] = brier_scores.mean()
             out[split + '_zero_one_loss'] = zero_one_losses.mean()
             out[split + '_entropy'] = entropies.mean()
+        
+        # also compute calibration on larger val dataset
+        t0 = time.time()
+        X_val, Y_val, collaborator_probs_val = self.get_batch('val', num_examples=20000)
+        collaborator_predictions_val = None
+        with self.ctx:
+            _,_,_,ece_loss_val, sm_ece_loss_val, cross_ece_loss_multidim_val, sm_cross_ece_loss_multidim_val,_,_,_,_ = self.model(X_val, Y_val, collaborator_predictions_val, collaborator_probs_val)
+        ece_loss_val = ece_loss_val.item()
+        sm_ece_loss_val = sm_ece_loss_val.item()
+        out['val_ece_loss_val'] = ece_loss_val
+        out['val_sm_ece_loss_val'] = sm_ece_loss_val
+        if self.collaborator_model is not None:
+            cross_ece_loss_multidim_val = cross_ece_loss_multidim_val.item()
+            sm_cross_ece_loss_multidim_val = sm_cross_ece_loss_multidim_val.item()
+            out['val_cross_ece_loss_val'] = cross_ece_loss_multidim_val
+            out['val_sm_cross_ece_loss_val'] = sm_cross_ece_loss_multidim_val
+        t1 = time.time()
+        print(f"Time taken for computing calibration on larger val dataset: {t1 - t0} seconds")
+        
         self.model.train()
         return out
 
@@ -516,6 +509,8 @@ class Agent():
                         "val/zero_one_loss": losses['val_zero_one_loss'],
                         "train/entropy": losses['train_entropy'],
                         "val/entropy": losses['val_entropy'],
+                        "val/ece_loss_val": losses['val_ece_loss_val'],
+                        "val/sm_ece_loss_val": losses['val_sm_ece_loss_val'],
                         "lr": lr,
                         "mfu": running_mfu*100, # convert to percentage
                     }
@@ -531,6 +526,8 @@ class Agent():
                             "val/sm_cross_ece_loss_multidim": losses['val_sm_cross_ece_loss_multidim'],
                             "train/agreement": losses['train_agreement'],
                             "val/agreement": losses['val_agreement'],
+                            "val/cross_ece_loss_val": losses['val_cross_ece_loss_val'],
+                            "val/sm_cross_ece_loss_val": losses['val_sm_cross_ece_loss_val'],
                         })
                     wandb.log(log_data)
 
