@@ -72,6 +72,8 @@ confidence = False # use confidence calibration; otherwise use probability calib
 cross_probabilities = True # use collaborator's probabilities for cross calibration
 K = 5 # number of buckets for (cross) ECE
 answer_tokens = ['0', '1'] # possible answer tokens
+append_predictions = True # append predictions to output file
+append_probabilities = True # append probabilities to output file
 # model
 n_layer = 12
 n_head = 12
@@ -163,19 +165,28 @@ class Agent():
             print(f"agent {self.id} itos: {self.meta_itos}")
             self.encode = lambda s: [self.meta_stoi[c] for c in s]
             self.decode = lambda l: ''.join([self.meta_itos[i] for i in l])
+        self.answer_indices = torch.tensor([self.meta_stoi[token] for token in self.config['answer_tokens']], device=self.config['device'])
+        print(f"answer indices: {self.answer_indices.tolist()}")
 
         # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
         self.iter_num = 0
         self.best_val_loss = 1e9
+        
         self.prefix_size = self.config['prefix_size']
         self.block_size = self.config['block_size']
         self.example_size = self.config['example_size']
-
         # update prefix size, block size, and example size if collaborator model is used
         if self.collaborator_model is not None:
-            self.prefix_size = self.config['prefix_size'] + 1
-            self.block_size = self.config['block_size'] + 1
-            self.example_size = self.config['example_size'] + 1
+            if self.config['append_predictions']:
+                self.prefix_size += 2 # prediction and delimiter
+                self.block_size += 2
+                self.example_size += 2
+            if self.config['append_probabilities']:
+                num_answer_tokens = len(self.config['answer_tokens'])
+                self.prefix_size += num_answer_tokens * 5 # probabilities (rounded to 2 decimal places) and delimiters
+                self.block_size += num_answer_tokens * 5
+                self.example_size += num_answer_tokens * 5
+        print(f"prefix size: {self.prefix_size}, block size: {self.block_size}, example size: {self.example_size}")
 
         # model init
         self.model_args = dict(n_layer=self.config['n_layer'], n_head=self.config['n_head'], n_embd=self.config['n_embd'], block_size=self.block_size,
@@ -256,8 +267,8 @@ class Agent():
             input_file = os.path.join(data_dir, f'input{file_name_suffix}.txt')
             with open(input_file, 'r') as f:
                 lines = f.readlines()
-                collaborator_probs_list = [line.split(',')[1:] for line in lines]
-                collaborator_probs_list = [','.join(prob) for prob in collaborator_probs_list]
+                delimiter = ';'
+                collaborator_probs_list = [line.split(delimiter)[-1] for line in lines] # get last element
                 collaborator_probs_list = [ast.literal_eval(prob) for prob in collaborator_probs_list]
             self.collaborator_probs = torch.tensor(collaborator_probs_list, device=self.config['device'], dtype=torch.float32)
             t1 = time.time()
@@ -299,7 +310,6 @@ class Agent():
             collaborator_probs = collaborator_probs.unsqueeze(1) # shape (B, 1, V)
         else:
             collaborator_probs = None  
-
         return x, y, collaborator_probs
 
     def label_dataset(self, input_path, label_path, output_path, batch_size=2000):
@@ -325,14 +335,26 @@ class Agent():
                 # crop outputs to retrieve only the answer token
                 y = y[:, self.block_size:]
                 predictions = [self.decode(y[i].tolist()) for i in range(len(y))]
+                # get probabilities of answer tokens
+                answer_probs = torch.index_select(probs, dim=-1, index=self.answer_indices)
+                # round probabilities to 2 decimal places
+                # answer_probs = torch.round(answer_probs, decimals=2)
 
                 # write predictions to label file
                 label_lines = f_label_lines[start_line_idx:start_line_idx + batch_size]
-                for i, (label_line, prediction, prob) in enumerate(zip(label_lines, predictions, probs)):
+                for i, (label_line, prediction, prob) in enumerate(zip(label_lines, predictions, answer_probs)):
                     with open(output_path, "a", encoding="utf-8") as out:
-                        label_line = label_line.rstrip('\n')
-                        # write prediction+example, probabilities to output file
-                        out.write(f"{prediction}{label_line}, {prob[0].tolist()}\n")
+                        output_line = label_line.rstrip('\n')
+                        # write probabilities, prediction, and label to output file
+                        if self.config['append_predictions']:
+                            output_line = f"{prediction},{output_line}"
+                        if self.config['append_probabilities']:
+                            # prob is a list. convert prob to a string without brackets and join elemets with commas
+                            # round probabilities to 2 decimal places
+                            prob_string = ','.join(f"{p:.2f}" for p in prob[0].tolist())
+                            output_line = f"{prob_string},{output_line}"
+                        out.write(f"{output_line};{prob[0].tolist()}\n")   
+                        # out.write(f"{prob[0].tolist()};{prediction};{label_line}\n")
 
             # for i, (input_line, label_line) in enumerate(zip(f_input, f_label)):
             #     # generate prediction for input line
@@ -403,12 +425,7 @@ class Agent():
             for k in range(self.config['eval_iters']):
                 X, Y, collaborator_probs = self.get_batch(split)
                 collaborator_predictions = None
-                # if self.collaborator_model is not None: # get collaborator predictions and append to x
-                #     collaborator_predictions, collaborator_probs = self.get_collaborator_predictions(collaborator_X)
-                #     X, Y = self.append_collaborator_predictions(X, Y, collaborator_predictions)
-                # else:
-                #     collaborator_predictions = None
-                #     collaborator_probs = None
+
                 with self.ctx:
                     logits, CE_loss, loss, ece_loss_multidim, sm_ece_loss_multidim, cross_ece_loss_multidim, sm_cross_ece_loss_multidim, brier_score, zero_one_loss, entropy, agreement = self.model(X, Y, collaborator_predictions, collaborator_probs) # call foward function
                 CE_losses[k] = CE_loss.item()
@@ -462,12 +479,7 @@ class Agent():
         # training loop
         X, Y, collaborator_probs = self.get_batch('train') # fetch the very first batch
         collaborator_predictions = None
-        # if self.collaborator_model is not None: # get collaborator predictions and append to x
-        #     collaborator_predictions, collaborator_probs = self.get_collaborator_predictions(collaborator_X)
-        #     X, Y = self.append_collaborator_predictions(X, Y, collaborator_predictions)
-        # else:
-        #     collaborator_predictions = None
-        #     collaborator_probs = None
+
         t0 = time.time()
         local_iter_num = 0 # number of iterations in the lifetime of this process
         raw_model = self.model.module if self.ddp else self.model # unwrap DDP container if needed
@@ -553,12 +565,7 @@ class Agent():
                 # immediately async prefetch next batch while model is doing the forward pass on the GPU
                 X, Y, collaborator_probs = self.get_batch('train')
                 collaborator_predictions = None
-                # if self.collaborator_model is not None: # get collaborator predictions and append to x
-                #     collaborator_predictions, collaborator_probs = self.get_collaborator_predictions(collaborator_X)
-                #     X, Y = self.append_collaborator_predictions(X, Y, collaborator_predictions)
-                # else:
-                #     collaborator_predictions = None
-                #     collaborator_probs = None
+
                 # backward pass, with gradient scaling if training in fp16
                 self.scaler.scale(loss).backward()
             # clip the gradient

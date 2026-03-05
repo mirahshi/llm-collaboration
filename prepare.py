@@ -20,9 +20,9 @@ def prepare(input_file_path, file_name_suffix=''):
     
     with open(input_file_path, 'r') as f:
         data = f.read()
-        # keep only what is before delimiter ','
+        # keep only what is before delimiter ';'
         lines = data.splitlines(keepends=False)
-        processed_lines = [line.split(',')[0]+'\n' for line in lines]
+        processed_lines = [line.split(';')[0]+'\n' for line in lines]
         data = ''.join(processed_lines)
         
     print(f"length of dataset in characters: {len(data):,}")

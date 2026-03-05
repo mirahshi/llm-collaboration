@@ -439,11 +439,10 @@ class GPT(nn.Module):
         entropy = -torch.sum(probs * torch.log(probs), dim=-1)
         return entropy.mean(dim=(0,1))
 
-    def agreement(self, logits, collaborator_probs):
+    def agreement(self, probs, collaborator_probs):
         """
-        Computes agreement between the model and the collaborator.
+        Computes agreement between sampled predictions of the model and the collaborator.
         """
-        probs = F.softmax(logits, dim=-1)
         N = probs.size(0) * probs.size(1) # number of examples (B*T)
         predictions = torch.distributions.Categorical(probs=probs).sample()
         collaborator_predictions = torch.distributions.Categorical(probs=collaborator_probs).sample()
@@ -488,15 +487,15 @@ class GPT(nn.Module):
             zero_one_loss = self.zero_one_loss(logits, targets)
             
             if collaborator_predictions is not None or collaborator_probs is not None:
-                if collaborator_probs is not None:
-                    collaborator_answer_probs = torch.index_select(collaborator_probs, dim=-1, index=answer_indices)
+                # if collaborator_probs is not None:
+                #     collaborator_answer_probs = torch.index_select(collaborator_probs, dim=-1, index=answer_indices)
                 # calculate cross calibration error wrt collaborator predictions
                 # cross_ece_loss = self.cross_ECE(logits, targets, collaborator_predictions, collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=False, smooth_own=False, confidence=self.config.confidence)
-                cross_ece_loss_multidim = self.cross_ECE_multidim(answer_probs, labels, collaborator_predictions, collaborator_answer_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=False, smooth_own=False, confidence=self.config.confidence)
+                cross_ece_loss_multidim = self.cross_ECE_multidim(answer_probs, labels, collaborator_predictions, collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=False, smooth_own=False, confidence=self.config.confidence)
                 # print("cross ECE loss:", cross_ece_loss)
                 # print("cross ECE loss multidim:", cross_ece_loss_multidim)
                 # sm_cross_ece_loss = self.cross_ECE(logits, targets, collaborator_predictions, collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=True, smooth_own=True, confidence=self.config.confidence)
-                sm_cross_ece_loss_multidim = self.cross_ECE_multidim(answer_probs, labels, collaborator_predictions, collaborator_answer_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=True, smooth_own=True, confidence=self.config.confidence)
+                sm_cross_ece_loss_multidim = self.cross_ECE_multidim(answer_probs, labels, collaborator_predictions, collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=True, smooth_own=True, confidence=self.config.confidence)
                 # print("sm cross ECE loss:", sm_cross_ece_loss)
                 # print("sm cross ECE loss multidim:", sm_cross_ece_loss_multidim)
                 # print("--------------------------------")
@@ -508,7 +507,7 @@ class GPT(nn.Module):
                 #     print("smooth self ECE loss:", sm_ece_loss)
                 #     print("smooth cross ECE loss:", sm_cross_ece_loss)
                 #     raise ValueError("Smoothed cross ECE loss is less than smoothed self ECE loss. This should not happen.")
-                agreement = self.agreement(logits, collaborator_probs)
+                agreement = self.agreement(answer_probs, collaborator_probs)
                 
                 if self.config.cross_calibrate:
                     loss = loss + sm_cross_ece_loss_multidim * self.config.cross_multiplier

@@ -2,15 +2,14 @@ num_agents = 2
 num_rounds = 4
 start_from_round = 0 # which round to start from (begins at 0) 
 save_models = True # save models after each round
-out_dir_suffix = 'cal'
+out_dir_suffix = 'scratch'
 
 datasets = ['majority-mask'] * num_agents
 # datasets = ['maze'] * num_agents
 
 wandb_log = True # override via command line if you like
 wandb_project = 'parity'
-wandb_group_name = 'collab_exp8'
-# wandb_group_name = 'collab_exp7'
+wandb_group_name = 'collab_exp9'
 
 out_dir = f'out-{wandb_group_name}/{out_dir_suffix}'
 
@@ -19,15 +18,16 @@ eval_iters = 200
 log_interval = 10 # don't print too too often
 
 # calibrate?
-calibrate = 'smECE' # self-calibrate: None, 'smECE', 'brier'
-multiplier = 1 # multiplier for calibration loss
+calibrate = None # self-calibrate: None, 'smECE', 'brier'
+multiplier = 0.3 # multiplier for calibration loss
 cross_calibrate = False # cross-calibrate: smECE conditioned on collaborator's predictions
-cross_multiplier = 20 # multiplier for cross calibration loss
+cross_multiplier = 1 # multiplier for cross calibration loss
 confidence = False # use confidence calibration; otherwise use probability calibration
 cross_probabilities = True # use collaborator's probabilities for cross calibration
 K = 5 # number of buckets for (cross) ECE
 answer_tokens = ['0', '1'] # possible answer tokens
-# answer_tokens = ['d', 'r', 'u', 'l', '*'] # possible answer tokens
+append_predictions = True # append predictions to output file
+append_probabilities = False # append probabilities to output file
 
 # we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False
@@ -54,7 +54,7 @@ for idx in range(num_agents):
             raise ValueError(f"Prefix size for {dataset} is not the same as the first dataset")
 
 gradient_accumulation_steps = 1
-batch_size = 256
+batch_size = 512 #256
 block_size = prefix_size+1 # 32 # 256 # context of up to 256 previous characters
 
 # baby GPT model :)
@@ -64,10 +64,10 @@ n_embd = 240 # 384
 dropout = 0.0 # 0.2
 causal = True
 
-learning_rate = 3e-5 # 1e-4 # 1e-3 # with baby networks can afford to go a bit higher
-max_iters = 10000
-lr_decay_iters = 40000 # make equal to max_iters usually
-min_lr = 1e-4 # learning_rate / 10 usually
+learning_rate = 1e-4#3e-5 # 1e-4 # 1e-3 # with baby networks can afford to go a bit higher
+max_iters = 10000#20000
+lr_decay_iters = max_iters # make equal to max_iters usually
+min_lr = learning_rate / 10 # learning_rate / 10 usually
 beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
 
 warmup_iters = 100 # not super necessary potentially
