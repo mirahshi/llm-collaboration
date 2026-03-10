@@ -14,7 +14,7 @@ from termcolor import colored
 from config.config_maze import datasets, out_dir
 
 
-def prepare(input_file_path, file_name_suffix=''):
+def prepare(input_file_path, file_name_suffix='', save_original_data=False):
     print(colored(f"input file: {input_file_path}", 'blue'))
     assert os.path.exists(input_file_path), f"input file {input_file_path} does not exist"
     
@@ -77,13 +77,14 @@ def prepare(input_file_path, file_name_suffix=''):
         pickle.dump(meta, f)
 
     # save input file to out_dir
-    with open(os.path.join(out_dir, f'input{file_name_suffix}.txt'), 'w') as f:
-        f.write(data)
+    if save_original_data:
+        with open(os.path.join(out_dir, f'input{file_name_suffix}.txt'), 'w') as f:
+            f.write(data)
 
 
 if __name__ == "__main__":
     data_dir = os.path.join('data', datasets[0])
     input_file0 = os.path.join(data_dir, 'input0_round0.txt')
     input_file1 = os.path.join(data_dir, 'input1_round0.txt')
-    prepare(input_file0, '0_round0')
-    prepare(input_file1, '1_round0')
+    prepare(input_file0, '0_round0', save_original_data=True)
+    prepare(input_file1, '1_round0', save_original_data=True)

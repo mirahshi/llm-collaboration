@@ -269,9 +269,12 @@ class Agent():
             input_file = os.path.join(data_dir, f'input{file_name_suffix}.txt')
             with open(input_file, 'r') as f:
                 lines = f.readlines()
+                print("lines:", lines[:10])
                 delimiter = ';'
                 collaborator_probs_list = [line.split(delimiter)[-1] for line in lines] # get last element
+                print("collaborator_probs_list:", collaborator_probs_list[:10])
                 collaborator_probs_list = [ast.literal_eval(prob) for prob in collaborator_probs_list]
+                print("collaborator_probs_list:", collaborator_probs_list[:10])
             self.collaborator_probs = torch.tensor(collaborator_probs_list, device=self.config['device'], dtype=torch.float32)
             t1 = time.time()
             print(f"Time taken for fetching collaborator probabilities: {t1 - t0} seconds")
@@ -716,6 +719,7 @@ def train_converse(config):
     """Iteratively train agents using collaborator models."""
     # training loop: agents take turns training in rounds
     current_model = None # collaborator model to be used by the next agent. in the first round, the first agent trains by itself.
+    wandb_run_id = None  # track wandb run id so subsequent rounds resume the same run
     for r in range(config['num_rounds']):
         
         agent_id = r % config['num_agents'] # determine which agent trains this round
@@ -733,7 +737,13 @@ def train_converse(config):
                 
             # logging
             if config['wandb_log'] and agent.master_process:
-                wandb.init(project=config['wandb_project'], group=config['wandb_group_name'], name=config['wandb_run_name']+f"-round{r}-agent{agent.id}", config=config, reinit="finish_previous")
+                if wandb_run_id is None:
+                    # First round: create a brand-new wandb run
+                    wandb.init(project=config['wandb_project'], group=config['wandb_group_name'], name=config['wandb_run_name'], config=config)
+                    wandb_run_id = wandb.run.id
+                else:
+                    # Subsequent rounds: resume the same wandb run
+                    wandb.init(project=config['wandb_project'], group=config['wandb_group_name'], id=wandb_run_id, resume="must", reinit="finish_previous")
                 
             agent.train()
             current_model = agent.model

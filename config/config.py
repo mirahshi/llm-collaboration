@@ -1,8 +1,8 @@
-num_agents = 2
-num_rounds = 4
-start_from_round = 2 # which round to start from (begins at 0) 
+num_agents = 1
+num_rounds = 1
+start_from_round = 0 # which round to start from (begins at 0) 
 save_models = True # save models after each round
-out_dir_suffix = 'base-with-probs'
+out_dir_suffix = 'baseline'
 
 datasets = ['majority-mask'] * num_agents
 # datasets = ['maze'] * num_agents
@@ -20,7 +20,7 @@ log_interval = 10 # don't print too too often
 # calibrate?
 calibrate = None # self-calibrate: None, 'smECE', 'brier'
 multiplier = 0.3 # multiplier for calibration loss
-cross_calibrate = False # cross-calibrate: smECE conditioned on collaborator's predictions
+cross_calibrate = None # cross-calibrate: smECE conditioned on collaborator's predictions
 cross_multiplier = 1 # multiplier for cross calibration loss
 confidence = False # use confidence calibration; otherwise use probability calibration
 cross_probabilities = True # use collaborator's probabilities for cross calibration

@@ -1,6 +1,6 @@
 num_agents = 2
 num_rounds = 4
-start_from_round = 3 # which round to start from (begins at 0) 
+start_from_round = 0 # which round to start from (begins at 0) 
 save_models = True # save models after each round
 out_dir_suffix = 'base-with-probs'
 
@@ -8,7 +8,7 @@ datasets = ['maze'] * num_agents
 
 wandb_log = True # override via command line if you like
 wandb_project = 'parity'
-wandb_group_name = 'collab_exp14'
+wandb_group_name = 'collab_exp15'
 
 out_dir = f'out-{wandb_group_name}/{out_dir_suffix}'
 
