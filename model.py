@@ -441,12 +441,13 @@ class GPT(nn.Module):
 
     def agreement(self, probs, collaborator_probs):
         """
-        Computes agreement between sampled predictions of the model and the collaborator.
+        Computes l2 distance between probabilities of the model and the collaborator.
         """
-        N = probs.size(0) * probs.size(1) # number of examples (B*T)
-        predictions = torch.distributions.Categorical(probs=probs).sample()
-        collaborator_predictions = torch.distributions.Categorical(probs=collaborator_probs).sample()
-        return torch.sum(predictions == collaborator_predictions) / N
+        # N = probs.size(0) * probs.size(1) # number of examples (B*T)
+        # predictions = torch.distributions.Categorical(probs=probs).sample()
+        # collaborator_predictions = torch.distributions.Categorical(probs=collaborator_probs).sample()
+        # return torch.sum(predictions == collaborator_predictions) / N
+        return torch.norm(probs - collaborator_probs, p=2, dim=-1).mean(dim=(0,1))
 
     def forward(self, idx, targets=None, collaborator_predictions=None, collaborator_probs=None):
         device = idx.device

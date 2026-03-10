@@ -11,7 +11,7 @@ import numpy as np
 import sys
 from termcolor import colored
 
-from config.config import datasets, out_dir
+from config.config_maze import datasets, out_dir
 
 
 def prepare(input_file_path, file_name_suffix=''):
@@ -75,6 +75,10 @@ def prepare(input_file_path, file_name_suffix=''):
     }
     with open(os.path.join(out_dir, f'meta{file_name_suffix}.pkl'), 'wb') as f:
         pickle.dump(meta, f)
+
+    # save input file to out_dir
+    with open(os.path.join(out_dir, f'input{file_name_suffix}.txt'), 'w') as f:
+        f.write(data)
 
 
 if __name__ == "__main__":

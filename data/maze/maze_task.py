@@ -24,6 +24,7 @@ def generate_maze(
     height: int,
     wall_density: float = 0.30,
     seed: int | None = None,
+    shortest_path: bool = True
 ) -> list[list[str]]:
     """Return a height×width grid guaranteed to have at least one solution.
 
@@ -42,10 +43,56 @@ def generate_maze(
         grid[0][0] = "@"
         grid[height - 1][width - 1] = "*"
 
-        # ensure solvable
-        if _bfs_single(grid, width, height) is not None:
-            return grid
+        # ensure solvable and return all paths
+        if shortest_path and len(_bfs_all(grid, width, height)) >= 1:
+            return grid, _bfs_all(grid, width, height)
+        elif not shortest_path and len(find_all_paths(grid, width, height)) >= 1:
+            return grid, find_all_paths(grid, width, height)
+        else:
+            continue
 
+def generate_maze_single_path(
+    width: int,
+    height: int,
+    wall_density: float = 0.30,
+    seed: int | None = None,
+    shortest_path: bool = True
+) -> list[list[str]]:
+    """Return a height×width grid with exactly one shortest path.
+
+    Strategy: generate a solvable maze, pick one shortest path to keep,
+    then wall off cells that appear only in alternative shortest paths
+    until the chosen path is the unique shortest path.
+    """
+    rng = random.Random(seed)
+
+    # Start from a normally-generated solvable maze
+    grid, paths = generate_maze(width, height, wall_density, seed=seed, shortest_path=shortest_path)
+
+    while True:
+        if len(paths) <= 1:
+            return grid, paths[0]
+
+        # Keep a random shortest path; eliminate alternatives
+        chosen_path = rng.choice(paths)
+        chosen_cells = set(chosen_path)
+        alt_only_cells = set()
+        alt_paths = [p for p in paths if p != chosen_path]
+        for p in alt_paths:
+            alt_only_cells.update(set(p) - chosen_cells)
+        if not alt_only_cells:
+            # All shortest paths traverse identical cells (shouldn't
+            # happen for truly distinct paths, but guard anyway)
+            return grid, chosen_path
+        # Block a random cell that only alternative paths use
+        r, c = rng.choice(list(alt_only_cells))
+        grid[r][c] = "#"
+
+        # Recompute paths on the modified grid
+        if shortest_path:
+            paths = _bfs_all(grid, width, height)
+        else:
+            paths = find_all_paths(grid, width, height)
 
 # ---------------------------------------------------------------------------
 # Pathfinding
@@ -105,7 +152,7 @@ def _bfs_all(
     return results
 
 
-def find_paths(
+def find_shortest_paths(
     grid: list[list[str]], width: int, height: int, *, all_paths: bool = False
 ) -> list[list[tuple[int, int]]]:
     """Return either a single shortest path or all shortest paths."""
@@ -113,6 +160,58 @@ def find_paths(
         return _bfs_all(grid, width, height)
     p = _bfs_single(grid, width, height)
     return [p] if p is not None else []
+
+
+def find_all_paths(
+    grid: list[list[str]], width: int, height: int
+) -> list[list[tuple[int, int]]]:
+    """Return *all* paths from start to goal (not just shortest).
+
+    Uses depth-first search with backtracking.  Every simple (cycle-free)
+    path from (0, 0) to (height-1, width-1) is returned.
+
+    Paths that form "squares" are excluded: a candidate cell is rejected
+    if it is adjacent to any cell already on the path other than the
+    current tail (i.e. no 2×2 loops such as (1,0)→(1,1)→(2,1)→(2,0)).
+
+    Warning: the number of simple paths can be exponential in the maze
+    size – use only on small grids.
+    """
+    start, goal = (0, 0), (height - 1, width - 1)
+    results: list[list[tuple[int, int]]] = []
+    visited = {start}
+
+    def _forms_square(nr: int, nc: int, r: int, c: int) -> bool:
+        """Return True if (nr, nc) is adjacent to a visited path cell
+        other than the current tail (r, c)."""
+        for dr, dc, _ in _DIRS:
+            ar, ac = nr + dr, nc + dc
+            if (ar, ac) != (r, c) and (ar, ac) in visited:
+                return True
+        return False
+
+    def _dfs(path: list[tuple[int, int]]) -> None:
+        r, c = path[-1]
+        if (r, c) == goal:
+            results.append(list(path))
+            return
+        for dr, dc, _ in _DIRS:
+            nr, nc = r + dr, c + dc
+            if (
+                0 <= nr < height
+                and 0 <= nc < width
+                and (nr, nc) not in visited
+                and grid[nr][nc] != "#"
+                and not _forms_square(nr, nc, r, c)
+            ):
+                visited.add((nr, nc))
+                path.append((nr, nc))
+                _dfs(path)
+                path.pop()
+                visited.discard((nr, nc))
+
+    _dfs([start])
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +265,10 @@ def mask_maze(
                     m1[r][c] = ch
                 else:
                     m2[r][c] = ch
+                # if rng.random() < 0.4:
+                #     m1[r][c] = ch
+                # elif rng.random() > 0.6:
+                #     m2[r][c] = ch
     return m1, m2
 
 
@@ -200,7 +303,9 @@ def generate_samples(
     all_paths: bool = False,
     path_format: str = "directions",
     seed: int | None = None,
-    mask: bool = True
+    mask: bool = True,
+    single_path: bool = False,
+    shortest_path: bool = True
 ) -> Iterator[dict]:
     """Yield dicts with keys: maze, m1, m2, paths, samples.
 
@@ -213,13 +318,17 @@ def generate_samples(
     path_format   : "directions" or "coords"
     seed          : reproducibility seed
     """
+    print("shortest_path:", shortest_path)
     rng_seed = random.Random(seed)
     fmt = path_to_directions if path_format == "directions" else path_to_coords
 
     for _ in range(n):
         s = rng_seed.randint(0, 2**31)
-        grid = generate_maze(width, height, wall_density, seed=s)
-        paths = find_paths(grid, width, height, all_paths=all_paths)
+        if single_path:
+            grid, path = generate_maze_single_path(width, height, wall_density, seed=s, shortest_path=shortest_path)
+            paths = [path]
+        else:
+            grid, paths = generate_maze(width, height, wall_density, seed=s, shortest_path=shortest_path)
         if mask:
             m1, m2 = mask_maze(grid, width, height, seed=s + 1)
         else:
@@ -287,9 +396,11 @@ if __name__ == "__main__":
     parser.add_argument("--height", type=int, default=6)
     parser.add_argument("--wall-density", type=float, default=0.30)
     parser.add_argument("--n", type=int, default=3, help="number of mazes")
-    parser.add_argument("--all-paths", action="store_true", help="enumerate all shortest paths")
+    parser.add_argument("--all-paths", action="store_true", help="enumerate all shortest (or all) paths")
     parser.add_argument("--path-format", choices=["directions", "coords"], default="directions")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--single-path", action="store_true", help="output maze with a single path")
+    parser.add_argument("--shortest-path", action="store_true", help="enumerate shortest paths")
     args = parser.parse_args()
 
     for i, data in enumerate(generate_samples(
@@ -300,6 +411,8 @@ if __name__ == "__main__":
         all_paths=args.all_paths,
         path_format=args.path_format,
         seed=args.seed,
+        single_path=args.single_path,
+        shortest_path=args.shortest_path
     )):
         print(f"\n{'='*60}")
         print(f"  MAZE {i+1}")

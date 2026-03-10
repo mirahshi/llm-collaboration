@@ -2,15 +2,18 @@
 Generate masked maze examples.
 """
 from maze_task import generate_samples
+import time
 
-def generate(n, width, height, wall_density, all_paths=True, pad_solutions=False, pad_examples=False, mask=True):
+def generate(n, width, height, wall_density, all_paths=True, pad_solutions=False, pad_examples=False, mask=True, single_path=False, shortest_path=True):
     examples0 = []
     examples1 = []
+    solution_lengths = []
 
-    samples = generate_samples(width=width, height=height, wall_density=wall_density, n=n, all_paths=all_paths, mask=mask)
+    samples = generate_samples(width=width, height=height, wall_density=wall_density, n=n, all_paths=all_paths, mask=mask, single_path=single_path, shortest_path=shortest_path)
     for data in samples:
         examples0.extend(data["samples_m1"])
         examples1.extend(data["samples_m2"])
+        solution_lengths.extend([len(sol) for sol in data["solutions"]])
     print(f"Generated {len(examples0)} examples")
     
     if pad_solutions:
@@ -30,25 +33,31 @@ def generate(n, width, height, wall_density, all_paths=True, pad_solutions=False
 
         examples0_padded = []
         for example in examples0:
-            answer_length = len(example.split("=")[1])
+            sol = example.split("=")[1]
+            answer_length = len(sol)
             for i in reversed(range(max_answer_length - answer_length, max_answer_length)):
-                if i == 0:
-                    example_padded = example
+                idx = i - (max_answer_length - answer_length)
+                if idx == 0:
+                    example_padded = "_" * i + example
                 else:
-                    example_padded = "_" * i + example[:-i]
+                    example_padded = "_" * i + example[:-idx]
                 examples0_padded.append(example_padded)
+
         examples1_padded = []
         for example in examples1:
-            answer_length = len(example.split("=")[1])
+            sol = example.split("=")[1]
+            answer_length = len(sol)
             for i in reversed(range(max_answer_length - answer_length, max_answer_length)):
-                if i == 0:
-                    example_padded = example
+                idx = i - (max_answer_length - answer_length)
+                if idx == 0:
+                    example_padded = "_" * i + example
                 else:
-                    example_padded = "_" * i + example[:-i]
+                    example_padded = "_" * i + example[:-idx]
                 examples1_padded.append(example_padded)
 
         examples0 = examples0_padded
         examples1 = examples1_padded
+
         
     print(f"Generated {len(examples0)} examples after padding")
     
@@ -62,14 +71,19 @@ def generate(n, width, height, wall_density, all_paths=True, pad_solutions=False
 
 
 if __name__ == "__main__":
-    n = 2000 #300 # gives us 4833 examples (without padding)
-    width = 4#6
-    height = 4#6
+    n = 200000#100000#200000
+    width = 6#10#6
+    height = 6#10#6
     wall_density = 0.30 # each cell has a 30% probability of being a wall
     all_paths = True
-    pad_solutions = True
+    pad_solutions = False
     pad_examples = True
     mask = True
-    generate(n, width, height, wall_density, all_paths, pad_solutions, pad_examples, mask)
+    single_path = True # generate mazes with only one possible path
+    shortest_path = False
+    t0 = time.time()
+    generate(n, width, height, wall_density, all_paths, pad_solutions, pad_examples, mask, single_path, shortest_path)
+    t1 = time.time()
+    print(f"Time taken: {t1 - t0} seconds")
 
 
