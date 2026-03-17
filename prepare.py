@@ -14,17 +14,17 @@ from termcolor import colored
 from config.config_maze import datasets, out_dir
 
 
-def prepare(input_file_path, file_name_suffix='', save_original_data=False):
+def prepare(input_file_path, out_dir, file_name_suffix='', save_original_data=False):
     print(colored(f"input file: {input_file_path}", 'blue'))
     assert os.path.exists(input_file_path), f"input file {input_file_path} does not exist"
-    
+
     with open(input_file_path, 'r') as f:
         data = f.read()
         # keep only what is before delimiter ';'
         lines = data.splitlines(keepends=False)
         processed_lines = [line.split(';')[0]+'\n' for line in lines]
         data = ''.join(processed_lines)
-        
+
     print(f"length of dataset in characters: {len(data):,}")
 
     # get all the unique characters that occur in this text
@@ -83,8 +83,25 @@ def prepare(input_file_path, file_name_suffix='', save_original_data=False):
 
 
 if __name__ == "__main__":
-    data_dir = os.path.join('data', datasets[0])
-    input_file0 = os.path.join(data_dir, 'input0_round0.txt')
-    input_file1 = os.path.join(data_dir, 'input1_round0.txt')
-    prepare(input_file0, '0_round0', save_original_data=True)
-    prepare(input_file1, '1_round0', save_original_data=True)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Prepare dataset for training and evaluation.")
+    parser.add_argument('--input_file', type=str, default=None, help='Path to the input file (e.g., data/majority-mask/input0_round0.txt)')
+    parser.add_argument('--out_dir', type=str, default=None, help='Directory to save outputs (e.g., out-majority-mask)')
+    parser.add_argument('--suffix', type=str, default='', help='Suffix to use for output files (e.g., 0_round0)')
+    args = parser.parse_args()
+
+    if args.out_dir is not None:
+        out_dir = args.out_dir
+    if args.input_file is not None:
+        input_file = args.input_file
+        if args.suffix is not None:
+            suffix = args.suffix
+        prepare(input_file, out_dir, suffix, save_original_data=True)
+    else:
+        # prepare agent 0 and agent 1 input files from data directory
+        data_dir = os.path.join('data', datasets[0])
+        input_file0 = os.path.join(data_dir, 'input0_round0.txt')
+        input_file1 = os.path.join(data_dir, 'input1_round0.txt')
+        prepare(input_file0, '0_round0', save_original_data=True)
+        prepare(input_file1, '1_round0', save_original_data=True)

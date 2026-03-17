@@ -71,9 +71,9 @@ def generate(n, width, height, wall_density, all_paths=True, pad_solutions=False
 
 
 if __name__ == "__main__":
-    n = 100000#200000
-    width = 10#6
-    height = 10#6
+    n = 100#200000
+    width = 8#6
+    height = 8#6
     wall_density = 0.30 # each cell has a 30% probability of being a wall
     all_paths = True
     pad_solutions = False

@@ -2,13 +2,13 @@ num_agents = 2
 num_rounds = 4
 start_from_round = 0 # which round to start from (begins at 0) 
 save_models = True # save models after each round
-out_dir_suffix = 'base-with-probs'
+out_dir_suffix = 'scratch'
 
 datasets = ['maze'] * num_agents
 
 wandb_log = True # override via command line if you like
 wandb_project = 'parity'
-wandb_group_name = 'collab_exp15'
+wandb_group_name = 'collab_exp14'
 
 out_dir = f'out-{wandb_group_name}/{out_dir_suffix}'
 
@@ -23,7 +23,8 @@ cross_calibrate = False # cross-calibrate: smECE conditioned on collaborator's p
 cross_multiplier = 1 # multiplier for cross calibration loss
 confidence = False # use confidence calibration; otherwise use probability calibration
 cross_probabilities = True # use collaborator's probabilities for cross calibration
-K = 3 # number of buckets for (cross) ECE
+K = 10 # number of buckets for self ECE
+K_cross = 10 # number of buckets for cross ECE
 answer_tokens = ['d', 'r', 'u', 'l'] # possible answer tokens
 append_predictions = True # append predictions to output file
 append_probabilities = True # append probabilities to output file
@@ -35,9 +36,11 @@ wandb_run_name = ''
 if confidence:
     wandb_run_name = wandb_run_name + 'conf'
 if calibrate is not None:
-    wandb_run_name = wandb_run_name + f'cal-{calibrate}K{K}x{multiplier}'
+    wandb_run_name = wandb_run_name + f'cal-{calibrate}K{K}K_cross{K_cross}x{multiplier}'
+else:
+    wandb_run_name = wandb_run_name + f'nocal-K{K}K_cross{K_cross}'
 if cross_calibrate: 
-    wandb_run_name = wandb_run_name + f'crossK{K}x{cross_multiplier}'
+    wandb_run_name = wandb_run_name + f'crossK{K_cross}x{cross_multiplier}'
 if append_probabilities:
     wandb_run_name += '-with-probs'
 
@@ -57,11 +60,11 @@ for idx in range(num_agents):
             raise ValueError(f"Prefix size for {dataset} is not the same as the first dataset")
 
 gradient_accumulation_steps = 1
-batch_size = 512
+batch_size = 1024
 block_size = prefix_size+1 # 32 # 256 # context of up to 256 previous characters
 
 # baby GPT model :)
-n_layer = 2
+n_layer = 2 # TODO: TRY MORE LAYERS
 n_head = 6
 n_embd = 240 # 384
 dropout = 0.0 # 0.2

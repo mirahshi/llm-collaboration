@@ -131,6 +131,7 @@ class GPTConfig:
     confidence: bool = True
     cross_probabilities: bool = False
     K: int = 5
+    K_cross: int = 5
     answer_tokens: list = field(default_factory=lambda: [''])
     causal: bool = True
 
@@ -302,7 +303,6 @@ class GPT(nn.Module):
             unnorm_weights = torch.exp(- (diff_norm) / (2 * sigma ** 2))
             weights = unnorm_weights / unnorm_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
         else:
-            # define D-dimensional hard buckets using uniform cells
             edges_1d = torch.linspace(0, 1, K+1, device=probs.device, dtype=probs.dtype)
             idx_per_coord = torch.bucketize(predictions, edges_1d, right=True)-1 # shape B x T x D: index of 1-dim bucket that prediction[b,t,d] is in
             idx_per_coord.clamp_(min=0, max=K-1)
@@ -323,6 +323,114 @@ class GPT(nn.Module):
         ece_loss = (S * torch.linalg.norm(p_bar - y_bar, ord=2, dim=-1)).sum() / N
 
         return ece_loss   
+
+    def ECE_multidim_new(self, probs, labels, K=5, K_cross=5, smooth=False, sigma=0.1, collaborator_probs=None, confidence=True):
+        """
+        Computes ECE loss on probabilities and labels. 
+        If smooth is False, uses ECE loss (K buckets).
+        If smooth is True, uses smooth ECE loss (Gaussian weights centered at K points with std dev sigma).
+        if collaborator_probs is not None, use it to compute cross ECE.
+        """
+
+        if confidence:
+            # sample predictions from probs
+            sampled_predictions = torch.distributions.Categorical(probs=probs).sample()
+            conf_labels = torch.gather(labels, dim=-1, index=sampled_predictions.unsqueeze(-1))
+            conf_labels = conf_labels.squeeze(-1)
+            labels = conf_labels.unsqueeze(-1) # shape B x T x 1 (D = 1)
+            # use max probabilities as predictions
+            predictions = torch.max(probs, dim=-1).values.unsqueeze(-1) # shape B x T x 1 (D = 1)
+            # TODO: specify collaborator predictions
+        else:
+            predictions = probs
+            if collaborator_probs is not None:
+                collaborator_predictions = collaborator_probs
+        
+        B, T, D = predictions.shape # prediction dimension
+        N = B * T # number of examples
+        num_buckets = K ** D # number of buckets
+
+        flat_predictions = predictions.reshape(N, D)
+        flat_labels = labels.to(dtype=probs.dtype).reshape(N, D)
+              
+        if smooth:
+            # soft bucket assignment: define D-dimensional soft buckets using Gaussian kernels
+            centers_1d = torch.linspace(0, 1, K, device=probs.device, dtype=probs.dtype)
+            grids = torch.meshgrid([centers_1d] * D, indexing="ij")
+            centers = torch.stack(grids, dim=-1).reshape(-1, D)  # shape K^D x D
+            diff = predictions.unsqueeze(-2) - centers.unsqueeze(0).unsqueeze(0)  # shape B x T x K^D x D
+            diff_norm = (torch.pow(diff, 2)).sum(dim=-1)  # shape B x T x K^D; L2 norm squared across D
+            unnorm_weights = torch.exp(- (diff_norm) / (2 * sigma ** 2))
+            weights = unnorm_weights / unnorm_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+            if collaborator_probs is not None: # cross ECE buckets are joint buckets of the model and the collaborator
+                # define D-dimensional soft buckets using Gaussian kernels
+                centers_1d_collab = torch.linspace(0, 1, K_cross, device=probs.device, dtype=probs.dtype)
+                grids_collab = torch.meshgrid([centers_1d_collab] * D, indexing="ij")
+                centers_collab = torch.stack(grids_collab, dim=-1).reshape(-1, D)  # shape K^D x D
+                diff_collab = collaborator_predictions.unsqueeze(-2) - centers_collab.unsqueeze(0).unsqueeze(0)  # shape B x T x K_cross^D x D
+                diff_norm_collab = (torch.pow(diff_collab, 2)).sum(dim=-1)  # shape B x T x K_cross^D; L2 norm across D
+                unnorm_weights_collab = torch.exp(- (diff_norm_collab) / (2 * sigma ** 2))
+                weights_collaborator = unnorm_weights_collab / unnorm_weights_collab.sum(dim=-1, keepdim=True).clamp_min(1e-12) 
+
+                joint_weights = weights_collaborator.unsqueeze(-1) * weights.unsqueeze(-2) # shape B x T x K_cross^D x K^D
+                joint_weights = joint_weights.reshape(probs.size(0), probs.size(1), -1) # flatten to shape B x T x (K_cross^D*K^D)
+                weights = joint_weights
+
+            S = weights.sum(dim=(0, 1)) # sum of weights for each bucket
+
+            p_bar = (weights.unsqueeze(-1) * predictions.unsqueeze(-2)).sum(dim=(0, 1)) / S.clamp_min(1e-12).unsqueeze(-1)
+            y_bar = (weights.unsqueeze(-1) * labels.unsqueeze(-2)).sum(dim=(0, 1)) / S.clamp_min(1e-12).unsqueeze(-1)
+        else:
+            # hard bucket assignment: each example gets one D-dimensional bucket
+            edges_1d = torch.linspace(0, 1, K + 1, device=probs.device, dtype=probs.dtype)
+            idx_per_coord = torch.bucketize(flat_predictions, edges_1d, right=True) - 1  # N x D: index of 1-dim bucket that prediction[n,d] is in
+            idx_per_coord.clamp_(min=0, max=K - 1)
+            powers = (K ** torch.arange(D, device=probs.device, dtype=torch.int64))  # D
+            own_idx = (idx_per_coord.to(torch.int64) * powers).sum(dim=-1)  # N: index of D-dim bucket that prediction[n] is in
+            if collaborator_probs is None:
+                # use active buckets only
+                active_bucket_ids, inverse = torch.unique(own_idx, sorted=False, return_inverse=True)
+                M = active_bucket_ids.numel()  # M <= N
+
+                S = torch.zeros(M, device=probs.device, dtype=probs.dtype)
+                wp = torch.zeros(M, D, device=probs.device, dtype=probs.dtype)
+                wl = torch.zeros(M, D, device=probs.device, dtype=probs.dtype)
+
+                ones = torch.ones(N, device=probs.device, dtype=probs.dtype)
+                S.scatter_add_(0, inverse, ones) # number of examples in each bucket
+                inverse_exp = inverse.unsqueeze(-1).expand(-1, D) 
+                wp.scatter_add_(0, inverse_exp, flat_predictions) # weighted sum of predictions in each bucket
+                wl.scatter_add_(0, inverse_exp, flat_labels) # weighted sum of labels in each bucket
+            else:
+                flat_collab_predictions = collaborator_predictions.reshape(N, D)
+                edges_1d_collab = torch.linspace(0, 1, K_cross + 1, device=probs.device, dtype=probs.dtype)
+                collab_coord_idx = torch.bucketize(flat_collab_predictions, edges_1d_collab, right=True) - 1
+                collab_coord_idx.clamp_(0, K_cross - 1)
+                powers_collab = (K_cross ** torch.arange(D, device=probs.device, dtype=torch.int64))
+                collab_idx = (collab_coord_idx.to(torch.int64) * powers_collab).sum(dim=-1)
+
+                joint_idx_raw = own_idx + (K ** D) * collab_idx
+                _, joint_inverse = torch.unique(joint_idx_raw, sorted=False, return_inverse=True) # index of joint bucket that prediction[n] is in
+
+                M = int(joint_inverse.max().item()) + 1 # number of joint buckets
+
+                S = torch.zeros(M, device=probs.device, dtype=probs.dtype)
+                wp = torch.zeros(M, D, device=probs.device, dtype=probs.dtype)
+                wl = torch.zeros(M, D, device=probs.device, dtype=probs.dtype)
+
+                ones = torch.ones(N, device=probs.device, dtype=probs.dtype)
+                S.scatter_add_(0, joint_inverse, ones)
+                joint_exp = joint_inverse.unsqueeze(-1).expand(-1, D)
+                wp.scatter_add_(0, joint_exp, flat_predictions)
+                wl.scatter_add_(0, joint_exp, flat_labels)
+
+            p_bar = wp / S.clamp_min(1e-12).unsqueeze(-1)
+            y_bar = wl / S.clamp_min(1e-12).unsqueeze(-1)
+           
+        ece_loss = (S * torch.linalg.norm(p_bar - y_bar, ord=2, dim=-1)).sum() / N
+
+        return ece_loss
 
     def cross_ECE(self, logits, targets, collaborator_predictions, collaborator_probs=None, K=5, cross_probabilities=False, smooth_collaborator=False, smooth_own=False, sigma=0.1, confidence=True):
         """
@@ -409,17 +517,16 @@ class GPT(nn.Module):
         cross_ece_loss = self.ECE_multidim(probs, labels, K=K, smooth=smooth_own, sigma=sigma, weights_collaborator=weights_collaborator, confidence=confidence)
         
         return cross_ece_loss         
-    
-    def brier_score(self, logits, targets):
+
+    def brier_score(self, probs, labels):
         """
-        Computes Brier score on argmax probabilities and accuracy.
+        Computes Brier score: sum_{i=1}^D (p_i - y_i)^2 / N.
         """
-        probs = F.softmax(logits, dim=-1)
-        N = probs.size(0) * probs.size(1) # number of examples (B*T)
-        max_prob_indices = torch.argmax(probs, dim=-1)
-        max_probs = torch.amax(probs, dim=-1)
-        max_prob_labels = (max_prob_indices == targets).float()
-        return torch.sum((max_probs - max_prob_labels) ** 2) / N
+        B, T, D = probs.shape # prediction dimension
+        N = B * T # number of examples
+        flat_probs = probs.reshape(N, D)
+        flat_labels = labels.to(dtype=probs.dtype).reshape(N, D)
+        return torch.sum((flat_probs - flat_labels) ** 2) / N
 
     def zero_one_loss(self, logits, targets):
         """
@@ -480,34 +587,25 @@ class GPT(nn.Module):
             answer_probs = torch.index_select(probs, dim=-1, index=answer_indices)
             labels = (answer_indices.unsqueeze(0).unsqueeze(0) == targets.unsqueeze(-1)) 
             
-            # ece_loss = self.ECE(logits, targets, K=self.config.K, smooth=False, confidence=self.config.confidence)
-            ece_loss_multidim = self.ECE_multidim(answer_probs, labels, K=self.config.K, smooth=False, confidence=self.config.confidence)
-            # sm_ece_loss = self.ECE(logits, targets, K=self.config.K, smooth=True, confidence=self.config.confidence)
-            sm_ece_loss_multidim = self.ECE_multidim(answer_probs, labels, K=self.config.K, smooth=True, confidence=self.config.confidence)
-            brier_score = self.brier_score(logits, targets)
+            # ece_loss_multidim = self.ECE_multidim(answer_probs, labels, K=self.config.K, smooth=False, confidence=self.config.confidence)
+            # sm_ece_loss_multidim = self.ECE_multidim(answer_probs, labels, K=self.config.K, smooth=True, confidence=self.config.confidence)
+            ece_loss_multidim = torch.tensor(0.0, device=device, dtype=torch.float32)
+            sm_ece_loss_multidim = torch.tensor(0.0, device=device, dtype=torch.float32)
+            ece_loss_multidim_new = self.ECE_multidim_new(answer_probs, labels, K=self.config.K, K_cross=self.config.K_cross, smooth=False, sigma=0.1, confidence=self.config.confidence)
+            sm_ece_loss_multidim_new = torch.tensor(0.0, device=device, dtype=torch.float32)
+            # sm_ece_loss_multidim_new = self.ECE_multidim_new(answer_probs, labels, K=self.config.K, K_cross=self.config.K_cross, smooth=True, sigma=0.1, confidence=self.config.confidence)
+            brier_score = self.brier_score(answer_probs, labels)
             zero_one_loss = self.zero_one_loss(logits, targets)
             
             if collaborator_predictions is not None or collaborator_probs is not None:
-                # if collaborator_probs is not None:
-                #     collaborator_answer_probs = torch.index_select(collaborator_probs, dim=-1, index=answer_indices)
                 # calculate cross calibration error wrt collaborator predictions
-                # cross_ece_loss = self.cross_ECE(logits, targets, collaborator_predictions, collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=False, smooth_own=False, confidence=self.config.confidence)
-                cross_ece_loss_multidim = self.cross_ECE_multidim(answer_probs, labels, collaborator_predictions, collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=False, smooth_own=False, confidence=self.config.confidence)
-                # print("cross ECE loss:", cross_ece_loss)
-                # print("cross ECE loss multidim:", cross_ece_loss_multidim)
-                # sm_cross_ece_loss = self.cross_ECE(logits, targets, collaborator_predictions, collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=True, smooth_own=True, confidence=self.config.confidence)
-                sm_cross_ece_loss_multidim = self.cross_ECE_multidim(answer_probs, labels, collaborator_predictions, collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=True, smooth_own=True, confidence=self.config.confidence)
-                # print("sm cross ECE loss:", sm_cross_ece_loss)
-                # print("sm cross ECE loss multidim:", sm_cross_ece_loss_multidim)
-                # print("--------------------------------")
-                # if cross_ece_loss + 1e-6 < ece_loss:
-                #     print("self ECE loss:", ece_loss)
-                #     print("cross ECE loss:", cross_ece_loss)
-                #     raise ValueError("Cross ECE loss is less than self ECE loss. This should not happen.")
-                # if sm_cross_ece_loss + 1e-6 < sm_ece_loss:
-                #     print("smooth self ECE loss:", sm_ece_loss)
-                #     print("smooth cross ECE loss:", sm_cross_ece_loss)
-                #     raise ValueError("Smoothed cross ECE loss is less than smoothed self ECE loss. This should not happen.")
+                # cross_ece_loss_multidim = self.cross_ECE_multidim(answer_probs, labels, collaborator_predictions, collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=False, smooth_own=False, confidence=self.config.confidence)
+                # sm_cross_ece_loss_multidim = self.cross_ECE_multidim(answer_probs, labels, collaborator_predictions, collaborator_probs, K=self.config.K, cross_probabilities=self.config.cross_probabilities, smooth_collaborator=True, smooth_own=True, confidence=self.config.confidence)                
+                cross_ece_loss_multidim = torch.tensor(0.0, device=device, dtype=torch.float32)
+                sm_cross_ece_loss_multidim = torch.tensor(0.0, device=device, dtype=torch.float32)
+                cross_ece_loss_multidim_new = self.ECE_multidim_new(answer_probs, labels, K=self.config.K, K_cross=self.config.K_cross, smooth=False, sigma=0.1, collaborator_probs=collaborator_probs, confidence=self.config.confidence)
+                sm_cross_ece_loss_multidim_new = torch.tensor(0.0, device=device, dtype=torch.float32)
+                # sm_cross_ece_loss_multidim_new = self.ECE_multidim_new(answer_probs, labels, K=self.config.K, K_cross=self.config.K_cross, smooth=True, sigma=0.1, collaborator_probs=collaborator_probs, confidence=self.config.confidence)
                 agreement = self.agreement(answer_probs, collaborator_probs)
                 
                 if self.config.cross_calibrate:
@@ -517,14 +615,16 @@ class GPT(nn.Module):
                 # sm_cross_ece_loss = None
                 cross_ece_loss_multidim = None
                 sm_cross_ece_loss_multidim = None
+                cross_ece_loss_multidim_new = None
+                sm_cross_ece_loss_multidim_new = None
                 agreement = None
 
             if self.config.calibrate == 'smECE':
                 if collaborator_predictions is None and collaborator_probs is None:
-                    loss = loss + sm_ece_loss_multidim * self.config.multiplier
+                    loss = loss + sm_ece_loss_multidim_new * self.config.multiplier
                 else:
                     if self.config.cross_calibrate is False:
-                        loss = loss + sm_ece_loss_multidim * self.config.multiplier
+                        loss = loss + sm_ece_loss_multidim_new * self.config.multiplier
             # if self.config.calibrate == 'smECE':
             #     loss = loss + sm_ece_loss_multidim * self.config.multiplier
             elif self.config.calibrate == 'brier':
@@ -549,8 +649,12 @@ class GPT(nn.Module):
             brier_score = None
             zero_one_loss = None
             agreement = None
+            ece_loss_multidim_new = None
+            sm_ece_loss_multidim_new = None
+            cross_ece_loss_multidim_new = None
+            sm_cross_ece_loss_multidim_new = None
         entropy = self.entropy(logits)
-        return logits, CE_loss, loss, ece_loss_multidim, sm_ece_loss_multidim, cross_ece_loss_multidim, sm_cross_ece_loss_multidim, brier_score, zero_one_loss, entropy, agreement
+        return logits, CE_loss, loss, ece_loss_multidim, sm_ece_loss_multidim, cross_ece_loss_multidim, sm_cross_ece_loss_multidim, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, brier_score, zero_one_loss, entropy, agreement
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -674,7 +778,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _, _, _, _, _, _, _, _, _, _ = self(idx_cond)
+            logits, _, _, _, _, _, _, _, _, _, _, _, _, _, _= self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options

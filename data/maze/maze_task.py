@@ -360,9 +360,18 @@ def generate_samples(
 # Visualization helpers
 # ---------------------------------------------------------------------------
 
-def visualize_grid(flat: str, label: str = "") -> str:
-    """Pretty-print a flat maze string back as a grid with border."""
-    grid = flat_to_grid(flat)
+def visualize_grid(flat: str, label: str = "", width: int | None = None) -> str:
+    """Pretty-print a flat maze string back as a grid with border.
+
+    If *width* is given the flat string is split into rows of that width
+    (useful when newlines have been stripped, e.g. by format_sample).
+    Otherwise the string is split on '\\n' as produced by grid_to_flat.
+    """
+    if width is not None:
+        chars = [ch for ch in flat if ch != "\n"]
+        grid = [chars[i:i + width] for i in range(0, len(chars), width)]
+    else:
+        grid = flat_to_grid(flat)
     height, width = len(grid), len(grid[0])
     lines: list[str] = []
     if label:
@@ -401,6 +410,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--single-path", action="store_true", help="output maze with a single path")
     parser.add_argument("--shortest-path", action="store_true", help="enumerate shortest paths")
+    parser.add_argument("--no-mask", action="store_true", help="do not mask the maze")
     args = parser.parse_args()
 
     for i, data in enumerate(generate_samples(
@@ -412,7 +422,8 @@ if __name__ == "__main__":
         path_format=args.path_format,
         seed=args.seed,
         single_path=args.single_path,
-        shortest_path=args.shortest_path
+        shortest_path=args.shortest_path,
+        mask=not args.no_mask
     )):
         print(f"\n{'='*60}")
         print(f"  MAZE {i+1}")
@@ -442,3 +453,10 @@ if __name__ == "__main__":
         for s in data["samples_m2"]:
             print(f"    {s}")
         print()
+
+    grid1 = visualize_grid("@???.??#??#?.??#?.?##??#?#.??.?#.??*", label="Agent 0 view", width=args.width)
+    grid2 = visualize_grid("@#..?..?.#?.?..?.?.??..?.??#.?.??.#*", label="Agent 1 view", width=args.width)
+    answer = "ddrruurrrddlddrd"
+    print(grid1)
+    print(grid2)
+    print(f"path: {answer}")
