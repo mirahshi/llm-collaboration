@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# hyperparameter sweep
 
-for batch_size in 512,1024; do
-    for n_layer in 2; do
-        for dropout in 0.0; do
-            for learning_rate in 3e-4,1e-4,7e-5,3e-5,1e-5; do
-                for n_embd in 240; do
-                    for causal in True; do
-                        for max_iters in 25000; do
-                        wandb_run_name="batch_size${batch_size}-lr${learning_rate}"
-                        python train.py config/config_maze.py --wandb_run_name=$wandb_run_name --batch_size=$batch_size --n_layer=$n_layer --dropout=$dropout --learning_rate=$learning_rate --min_lr=$learning_rate --n_embd=$n_embd --causal=$causal --max_iters=$max_iters
-                    done
-                done
-            done
+for m_lookahead in 2 3 5; do
+    if (( m_lookahead > 1 )); then
+        for autoregressive_lookahead in True False; do
+            wandb_group_name="collab_exp17"
+            wandb_run_name="m${m_lookahead}autoregressive${autoregressive_lookahead}"
+            out_dir="out-${wandb_group_name}/${wandb_run_name}"
+            python data/maze/generate.py --out_dir=${out_dir} --m_lookahead=${m_lookahead}
+            python prepare.py --input_file=${out_dir}/input0_round0.txt --out_dir=${out_dir} --suffix="0_round0"
+            python prepare.py --input_file=${out_dir}/input1_round0.txt --out_dir=${out_dir} --suffix="1_round0"
+            python train_converse.py config/config_maze.py --wandb_group_name=${wandb_group_name} --wandb_run_name=${wandb_run_name} --out_dir=${out_dir} --m_lookahead=${m_lookahead} --autoregressive_lookahead=${autoregressive_lookahead}
         done
-    done
+    else
+        wandb_group_name="collab_exp17"
+        wandb_run_name="m${m_lookahead}"
+        out_dir="out-${wandb_group_name}/${wandb_run_name}"
+        python data/maze/generate.py --out_dir=${out_dir} --m_lookahead=${m_lookahead}
+        python prepare.py --input_file=${out_dir}/input0_round0.txt --out_dir=${out_dir} --suffix="0_round0"
+        python prepare.py --input_file=${out_dir}/input1_round0.txt --out_dir=${out_dir} --suffix="1_round0"
+        python train_converse.py config/config_maze.py --wandb_group_name=${wandb_group_name} --wandb_run_name=${wandb_run_name} --out_dir=${out_dir} --m_lookahead=${m_lookahead}
+    fi
 done

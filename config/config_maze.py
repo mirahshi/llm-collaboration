@@ -31,7 +31,7 @@ answer_tokens = ['d', 'r', 'u', 'l'] # possible answer tokens
 append_predictions = True # append predictions to output file
 append_probabilities = True # append probabilities to output file
 
-m_lookahead = 1 # number of autoregressive lookahead predictions to generate in one forward pass
+m_lookahead = 2 # number of autoregressive lookahead predictions to generate in one forward pass
 autoregressive_lookahead = True # use autoregressive lookahead (otherwise, use ground truth targets)
 
 # we expect to overfit on this small dataset, so only save when val improves
@@ -49,36 +49,39 @@ if m_lookahead > 1:
     if autoregressive_lookahead:
         wandb_run_name += 'autoregressive'
 
-import sys
-def _get_cli_arg(name, default):
-    prefix = f"--{name}="
-    for arg in sys.argv[1:]:
-        if arg.startswith(prefix):
-            return arg.split("=", 1)[1]
-    return default
-# override from command line if provided (e.g. --out_dir=out-collab_exp16/n_layer4)
-out_dir = _get_cli_arg("out_dir", out_dir)
-print(f"config out_dir: {out_dir}")
+# import sys
+# def _get_cli_arg(name, default):
+#     prefix = f"--{name}="
+#     for arg in sys.argv[1:]:
+#         if arg.startswith(prefix):
+#             return arg.split("=", 1)[1]
+#     return default
+# # override from command line if provided (e.g. --out_dir=out-collab_exp16/n_layer4)
+# out_dir = _get_cli_arg("out_dir", out_dir)
+# print(f"config out_dir: {out_dir}")
 
-# get prefix size and answer length from input files
-with open(f'{out_dir}/input0_round0.txt', 'r') as f:
-    lines = f.readlines()
-    example_size = len(lines[0].split('\n')[0]) + 1 # number of characters in the input example (including '\n')
-    prefix_size = len(lines[0].split('=')[0]) # number of characters in the input before the '='
-    target_size = len(lines[0].split('=')[1]) - 1 # number of characters in the target (excluding '\n')
-    assert target_size == m_lookahead, f"Target size {target_size} does not match m_lookahead {m_lookahead}"
-    print("config example size:", example_size)
-# check that the prefix size is the same for all agents
-for idx in range(num_agents):
-    with open(f'{out_dir}/input{idx}_round0.txt', 'r') as f:
-        lines = f.readlines()
-        if len(lines[0].split('=')[0]) != prefix_size:
-            raise ValueError(f"Prefix size for {dataset} is not the same as the first dataset")
+# # get prefix size and answer length from input files
+# with open(f'{data_dir}/input0_round0.txt', 'r') as f:
+#     lines = f.readlines()
+#     example_size = len(lines[0].split('\n')[0]) + 1 # number of characters in the input example (including '\n')
+#     block_size = example_size - 1 - m_lookahead
+#     prefix_size = block_size - 1
+#     # prefix_size = len(lines[0].split('=')[0]) # number of characters in the input before the '='
+#     # target_size = len(lines[0].split('=')[1]) - 1 # number of characters in the target (excluding '\n')
+#     #assert target_size == m_lookahead, f"Target size {target_size} does not match m_lookahead {m_lookahead}"
+#     print(f"config example size: {example_size}")
+#     print(f"config block size: {block_size}")
+#     print(f"config prefix size: {prefix_size}")
+# # check that the block size is the same for all agents
+# for idx in range(num_agents):
+#     with open(f'{data_dir}/input{idx}_round0.txt', 'r') as f:
+#         lines = f.readlines()
+#         if len(lines[0].split('\n')[0]) - m_lookahead != block_size:
+#             raise ValueError(f"Block size is not the same as the first dataset")
 
 gradient_accumulation_steps = 1
 batch_size = 1024
-block_size = prefix_size+1 # 32 # 256 # context of up to 256 previous characters
-print(f"config block size: {block_size}")
+# block_size = prefix_size+1 # 32 # 256 # context of up to 256 previous characters
 
 # baby GPT model :)
 n_layer = 4

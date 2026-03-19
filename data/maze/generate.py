@@ -5,7 +5,7 @@ from maze_task import generate_samples
 import time
 import os
 
-def generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths=True, pad_solutions=False, pad_examples=False, mask=True, single_path=False, shortest_path=True):
+def generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths=True, pad_solutions=False, pad_examples=False, mask=True, single_path=False, shortest_path=True, last_s_steps=None):
     examples0 = []
     examples1 = []
 
@@ -38,6 +38,8 @@ def generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths=Tru
             answer_length = len(sol)
             for i in reversed(range(max_answer_length - answer_length, max_answer_length - m_lookahead + 1)):
                 idx = i - (max_answer_length - answer_length)
+                if last_s_steps is not None and idx >= last_s_steps:
+                    continue
                 if idx == 0:
                     example_padded = "_" * i + example
                 else:
@@ -50,6 +52,8 @@ def generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths=Tru
             answer_length = len(sol)
             for i in reversed(range(max_answer_length - answer_length, max_answer_length - m_lookahead + 1)):
                 idx = i - (max_answer_length - answer_length)
+                if last_s_steps is not None and idx >= last_s_steps:
+                    continue                
                 if idx == 0:
                     example_padded = "_" * i + example
                 else:
@@ -61,6 +65,8 @@ def generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths=Tru
 
         
     print(f"Generated {len(examples0)} examples after padding")
+
+    os.makedirs(out_dir, exist_ok=True)
     
     # save the examples to a file
     with open(os.path.join(out_dir, "input0_round0.txt"), "w") as f:
@@ -75,12 +81,13 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Generate maze examples")
     parser.add_argument("--out_dir", type=str, help="Output directory")
+    parser.add_argument("--m_lookahead", type=int, help="Number of lookahead steps")
     if parser.parse_args().out_dir is None:
         out_dir = 'data/maze'
     else:
         out_dir = parser.parse_args().out_dir
     
-    n = 100000#200000
+    n = 200000#200000
     width = 6#6
     height = 6#6
     wall_density = 0.30 # each cell has a 30% probability of being a wall
@@ -90,9 +97,10 @@ if __name__ == "__main__":
     mask = True
     single_path = True # generate mazes with only one possible path
     shortest_path = False
-    m_lookahead = 3
+    m_lookahead = parser.parse_args().m_lookahead if parser.parse_args().m_lookahead is not None else 1
+    last_s_steps = None # generate examples with at most 4 steps to the finish (None to include all steps)
     t0 = time.time()
-    generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths, pad_solutions, pad_examples, mask, single_path, shortest_path)
+    generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths, pad_solutions, pad_examples, mask, single_path, shortest_path, last_s_steps)
     t1 = time.time()
     print(f"Time taken: {t1 - t0} seconds")
 

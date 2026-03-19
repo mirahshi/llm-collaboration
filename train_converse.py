@@ -179,9 +179,22 @@ class Agent():
         self.iter_num = 0
         self.best_val_loss = 1e9
         
-        self.prefix_size = self.config['prefix_size']
-        self.block_size = self.config['block_size']
-        self.example_size = self.config['example_size']
+        # self.prefix_size = self.config['prefix_size']
+        # self.block_size = self.config['block_size']
+        # self.example_size = self.config['example_size']
+        # get prefix size and answer length from input files
+        with open(f'{self.data_dir}/input0_round0.txt', 'r') as f:
+            lines = f.readlines()
+            self.example_size = len(lines[0].split('\n')[0]) + 1 # number of characters in the input example (including '\n')
+            self.block_size = self.example_size - 1 - self.config['m_lookahead']
+            self.prefix_size = self.block_size - 1
+            # prefix_size = len(lines[0].split('=')[0]) # number of characters in the input before the '='
+            # target_size = len(lines[0].split('=')[1]) - 1 # number of characters in the target (excluding '\n')
+            #assert target_size == m_lookahead, f"Target size {target_size} does not match m_lookahead {m_lookahead}"
+            print(f"got example size: {self.example_size}")
+            print(f"got block size: {self.block_size}")
+            print(f"got prefix size: {self.prefix_size}")
+        
         # update prefix size, block size, and example size if collaborator model is used
         if self.collaborator_model is not None:
             if self.config['append_predictions']:

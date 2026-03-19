@@ -599,20 +599,20 @@ class GPT(nn.Module):
                 
                 if self.config.m_lookahead == 1:
                     break # if we are only generating one step, we are done
-                
-                # generate next token and append to the running sequence
-                logits_cropped = logits[:, -1, :] # shape (b, vocab_size): last token logits
-                probs = F.softmax(logits_cropped, dim=-1)
-                if self.config.autoregressive_lookahead:
-                    # sample from the distribution to get the next token
-                    idx_next = torch.multinomial(probs, num_samples=1) # shape (b, 1)
                 else:
-                    # use ground truth for next token
-                    idx_next = targets[:, m:m+1] # shape (b, 1)
-                # append sampled index
-                input_idx = torch.cat((input_idx, idx_next), dim=1)
-                # shift input_idx by one step
-                input_idx = input_idx[:, 1:]
+                    # generate next token and append to the running sequence
+                    logits_cropped = logits[:, -1, :] # shape (b, vocab_size): last token logits
+                    probs = F.softmax(logits_cropped, dim=-1)
+                    if self.config.autoregressive_lookahead:
+                        # sample from the distribution to get the next token
+                        idx_next = torch.multinomial(probs, num_samples=1) # shape (b, 1)
+                    else:
+                        # use ground truth for next token
+                        idx_next = targets[:, m:m+1] # shape (b, 1)
+                    # append sampled index
+                    input_idx = torch.cat((input_idx, idx_next), dim=1)
+                    # shift input_idx by one step
+                    input_idx = input_idx[:, 1:]
 
 
 
