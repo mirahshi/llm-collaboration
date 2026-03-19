@@ -35,6 +35,7 @@ from model import GPTConfig, GPT
 from prepare import prepare
 import wandb
 from termcolor import colored
+import tqdm
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -73,6 +74,9 @@ confidence = False # use confidence calibration; otherwise use probability calib
 cross_probabilities = True # use collaborator's probabilities for cross calibration
 K = 5 # number of buckets for self ECE
 K_cross = 5 # number of buckets for cross ECE
+compute_smooth_calibration = False # compute smooth calibration losses (memory intensive)
+m_lookahead = 1 # number of autoregressive lookahead predictions to generate
+autoregressive_lookahead = True # use autoregressive lookahead (otherwise, use ground truth targets)
 answer_tokens = ['0', '1'] # possible answer tokens
 append_predictions = True # append predictions to output file
 append_probabilities = True # append probabilities to output file
@@ -190,11 +194,12 @@ class Agent():
                 self.block_size += num_answer_tokens * 5
                 self.example_size += num_answer_tokens * 5
         print(f"prefix size: {self.prefix_size}, block size: {self.block_size}, example size: {self.example_size}")
-
+        assert self.block_size == self.prefix_size + 1, f"block size {self.block_size} is not equal to prefix size {self.prefix_size} + 1"
+        
         # model init
         self.model_args = dict(n_layer=self.config['n_layer'], n_head=self.config['n_head'], n_embd=self.config['n_embd'], block_size=self.block_size,
                         bias=self.config['bias'], vocab_size=None, stoi=self.meta_stoi, itos=self.meta_itos, dropout=self.config['dropout'], prefix_size=self.prefix_size, example_size=self.example_size, calibrate=self.config['calibrate'], multiplier=self.config['multiplier'], 
-                        cross_calibrate=self.config['cross_calibrate'], cross_multiplier=self.config['cross_multiplier'], confidence=self.config['confidence'], causal=self.config['causal'], cross_probabilities=self.config['cross_probabilities'], K=self.config['K'], K_cross=self.config['K_cross'], answer_tokens=self.config['answer_tokens']) # start with model_args from command line
+                        cross_calibrate=self.config['cross_calibrate'], cross_multiplier=self.config['cross_multiplier'], confidence=self.config['confidence'], causal=self.config['causal'], cross_probabilities=self.config['cross_probabilities'], K=self.config['K'], K_cross=self.config['K_cross'], compute_smooth_calibration=self.config['compute_smooth_calibration'], m_lookahead=self.config['m_lookahead'], autoregressive_lookahead=self.config['autoregressive_lookahead'], answer_tokens=self.config['answer_tokens']) # start with model_args from command line
 
         
         if self.config['init_from'] == 'scratch':
@@ -297,7 +302,9 @@ class Agent():
         ix_examples = torch.randint(len(starting_indices), (num_examples,))
         ix = starting_indices[ix_examples]
         x = torch.stack([torch.from_numpy((data[i:i+self.block_size]).astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy((data[i+1:i+1+self.block_size]).astype(np.int64)) for i in ix])
+        # y = torch.stack([torch.from_numpy((data[i+1:i+1+self.block_size]).astype(np.int64)) for i in ix])
+        # shift target by m_lookahead steps
+        y = torch.stack([torch.from_numpy((data[i+self.config['m_lookahead']:i+self.config['m_lookahead']+self.block_size]).astype(np.int64)) for i in ix])
         if self.config['device'] == 'cuda':
             # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
             x, y = x.pin_memory().to(self.config['device'], non_blocking=True), y.pin_memory().to(self.config['device'], non_blocking=True)
@@ -331,7 +338,7 @@ class Agent():
             f_input.seek(0)  # reset file pointer to start
             f_label.seek(0)  # reset file pointer to start
             num_batches = len(f_input_lines) // batch_size
-            for batch_idx in range(num_batches):
+            for batch_idx in tqdm.tqdm(range(num_batches)):
                 start_line_idx = batch_idx * batch_size
                 input_lines = f_input_lines[start_line_idx:start_line_idx + batch_size]
                 starts = [input_line[:self.block_size] for input_line in input_lines]
@@ -365,19 +372,6 @@ class Agent():
         file_name_suffix = f'{next_agent_id}_round{self.round+1}'
         prepare(output_path, self.config['out_dir'], file_name_suffix)
     
-    # def get_collaborator_predictions(self, collaborator_x):
-    #     with self.ctx:
-    #         # get predictions and probabilities of collaborator model on inputs (no grad)
-    #         collaborator_predictions, collaborator_probs = self.collaborator_model.generate(collaborator_x, max_new_tokens=1, return_probs=True)
-    #         # crop outputs to retrieve only the answer token
-    #         collaborator_predictions = collaborator_predictions[:, self.base_prefix_size+1:]
-    #         return collaborator_predictions, collaborator_probs
-    
-    # def append_collaborator_predictions(self, x, y, collaborator_predictions):
-    #     # append collaborator predictions to end of prefix in x
-    #     x = torch.cat((x[:, :self.base_prefix_size], collaborator_predictions, x[:, self.base_prefix_size:]), dim=-1)
-    #     y = torch.cat((y[:, :self.base_prefix_size-1], collaborator_predictions, y[:, self.base_prefix_size-1:]), dim=-1)
-    #     return x, y
     
     @torch.no_grad()
     def maze_success_rate(self, num_mazes=1000):
@@ -388,7 +382,8 @@ class Agent():
             split_idx = int(num_examples*0.9)
             lines = lines[split_idx:]
             examples = [line.split(';')[0].rstrip('\n') for line in lines]
-            maze_starting_indices = [i for i, example in enumerate(examples) if example[-2] == '=']
+            # maze_starting_indices = [i for i, example in enumerate(examples) if example[-2] == '=']
+            maze_starting_indices = [i for i, example in enumerate(examples) if example[-self.config['m_lookahead']-1] == '=']
             sampled_mazes = random.sample(range(len(maze_starting_indices)), num_mazes) 
 
             num_successes = 0
@@ -405,7 +400,8 @@ class Agent():
                 # crop outputs to retrieve only the answer token
                 y = y[:, self.block_size:]
                 predictions = [self.decode(y[i].tolist()) for i in range(len(y))]
-                targets = [example[-1] for example in maze_lines]
+                # targets = [example[-1] for example in maze_lines]
+                targets = [example[-self.config['m_lookahead']] for example in maze_lines] # get next token
                 if all(pred == tgt for pred, tgt in zip(predictions, targets)):
                     num_successes += 1
             return num_successes / num_mazes
@@ -418,18 +414,11 @@ class Agent():
         self.model.eval()
         for split in ['train', 'val']:
             losses = torch.zeros(self.config['eval_iters'])
-            CE_losses = torch.zeros(self.config['eval_iters'])
-            # ece_losses = torch.zeros(self.config['eval_iters'])
-            ece_loss_multidims = torch.zeros(self.config['eval_iters'])
-            # sm_ece_losses = torch.zeros(self.config['eval_iters'])
-            sm_ece_loss_multidims = torch.zeros(self.config['eval_iters'])
+            # CE_losses = torch.zeros(self.config['eval_iters'])
+            CE_loss_sequences = [torch.zeros(self.config['eval_iters']) for m in range(0, self.config['m_lookahead'])]
             ece_loss_multidims_new = torch.zeros(self.config['eval_iters'])
             sm_ece_loss_multidims_new = torch.zeros(self.config['eval_iters'])
             if self.collaborator_model is not None:
-                # cross_ece_losses = torch.zeros(self.config['eval_iters'])
-                # sm_cross_ece_losses = torch.zeros(self.config['eval_iters'])
-                cross_ece_loss_multidims = torch.zeros(self.config['eval_iters'])
-                sm_cross_ece_loss_multidims = torch.zeros(self.config['eval_iters'])
                 cross_ece_loss_multidims_new = torch.zeros(self.config['eval_iters'])
                 sm_cross_ece_loss_multidims_new = torch.zeros(self.config['eval_iters'])
             brier_scores = torch.zeros(self.config['eval_iters'])
@@ -441,20 +430,14 @@ class Agent():
                 collaborator_predictions = None
 
                 with self.ctx:
-                    logits, CE_loss, loss, ece_loss_multidim, sm_ece_loss_multidim, cross_ece_loss_multidim, sm_cross_ece_loss_multidim, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, brier_score, zero_one_loss, entropy, agreement = self.model(X, Y, collaborator_predictions, collaborator_probs) # call foward function
-                CE_losses[k] = CE_loss.item()
+                    logits, CE_loss_sequence, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, brier_score, zero_one_loss, entropy, agreement = self.model(X, Y, collaborator_predictions, collaborator_probs) # call foward function
+                # CE_losses[k] = CE_loss.item()
+                for m in range(0, self.config['m_lookahead']):
+                    CE_loss_sequences[m][k] = CE_loss_sequence[m].item()
                 losses[k] = loss.item()
-                # ece_losses[k] = ece_loss.item()
-                ece_loss_multidims[k] = ece_loss_multidim.item()
-                # sm_ece_losses[k] = sm_ece_loss.item()
-                sm_ece_loss_multidims[k] = sm_ece_loss_multidim.item()
                 ece_loss_multidims_new[k] = ece_loss_multidim_new.item()
                 sm_ece_loss_multidims_new[k] = sm_ece_loss_multidim_new.item()
                 if self.collaborator_model is not None:
-                    # cross_ece_losses[k] = cross_ece_loss.item()
-                    # sm_cross_ece_losses[k] = sm_cross_ece_loss.item()
-                    cross_ece_loss_multidims[k] = cross_ece_loss_multidim.item()
-                    sm_cross_ece_loss_multidims[k] = sm_cross_ece_loss_multidim.item()
                     cross_ece_loss_multidims_new[k] = cross_ece_loss_multidim_new.item()
                     sm_cross_ece_loss_multidims_new[k] = sm_cross_ece_loss_multidim_new.item()
                     agreements[k] = agreement.item()
@@ -462,18 +445,12 @@ class Agent():
                 zero_one_losses[k] = zero_one_loss.item()
                 entropies[k] = entropy.item()
             out[split] = losses.mean()
-            out[split + '_CE_loss'] = CE_losses.mean()
-            # out[split + '_ece_loss'] = ece_losses.mean()
-            # out[split + '_sm_ece_loss'] = sm_ece_losses.mean()
-            out[split + '_ece_loss_multidim'] = ece_loss_multidims.mean()
-            out[split + '_sm_ece_loss_multidim'] = sm_ece_loss_multidims.mean()
+            # out[split + '_CE_loss'] = CE_losses.mean()
+            for m in range(0, self.config['m_lookahead']):
+                out[split + f'_CE_loss_step{m+1}'] = CE_loss_sequences[m].mean()
             out[split + '_ece_loss_multidim_new'] = ece_loss_multidims_new.mean()
             out[split + '_sm_ece_loss_multidim_new'] = sm_ece_loss_multidims_new.mean()
             if self.collaborator_model is not None:
-                # out[split + '_cross_ece_loss'] = cross_ece_losses.mean()
-                # out[split + '_sm_cross_ece_loss'] = sm_cross_ece_losses.mean()
-                out[split + '_cross_ece_loss_multidim'] = cross_ece_loss_multidims.mean()
-                out[split + '_sm_cross_ece_loss_multidim'] = sm_cross_ece_loss_multidims.mean()
                 out[split + '_cross_ece_loss_multidim_new'] = cross_ece_loss_multidims_new.mean()
                 out[split + '_sm_cross_ece_loss_multidim_new'] = sm_cross_ece_loss_multidims_new.mean()
                 out[split + '_agreement'] = agreements.mean()
@@ -483,18 +460,17 @@ class Agent():
         
         # also compute calibration on larger val dataset
         t0 = time.time()
-        # X_val, Y_val, collaborator_probs_val = self.get_batch('val', num_examples=10000)
         X_val, Y_val, collaborator_probs_val = self.get_batch('val', num_examples=10000)
         collaborator_predictions_val = None
         with self.ctx:
-            _,_,_,ece_loss_val, sm_ece_loss_val, cross_ece_loss_multidim_val, sm_cross_ece_loss_multidim_val, ece_loss_multidim_val_new, sm_ece_loss_multidim_val_new, cross_ece_loss_multidim_val_new, sm_cross_ece_loss_multidim_val_new,_,_,_,_ = self.model(X_val, Y_val, collaborator_predictions_val, collaborator_probs_val)
-        ece_loss_val = ece_loss_val.item()
-        sm_ece_loss_val = sm_ece_loss_val.item()
+            _,_,_,ece_loss_multidim_val_new, sm_ece_loss_multidim_val_new, cross_ece_loss_multidim_val_new, sm_cross_ece_loss_multidim_val_new,_,_,_,_ = self.model(X_val, Y_val, collaborator_predictions_val, collaborator_probs_val)
+        ece_loss_val = ece_loss_multidim_val_new.item()
+        sm_ece_loss_val = sm_ece_loss_multidim_val_new.item()
         out['val_ece_loss_val'] = ece_loss_val
         out['val_sm_ece_loss_val'] = sm_ece_loss_val
         if self.collaborator_model is not None:
-            cross_ece_loss_multidim_val = cross_ece_loss_multidim_val.item()
-            sm_cross_ece_loss_multidim_val = sm_cross_ece_loss_multidim_val.item()
+            cross_ece_loss_multidim_val = cross_ece_loss_multidim_val_new.item()
+            sm_cross_ece_loss_multidim_val = sm_cross_ece_loss_multidim_val_new.item()
             out['val_cross_ece_loss_val'] = cross_ece_loss_multidim_val
             out['val_sm_cross_ece_loss_val'] = sm_cross_ece_loss_multidim_val
         t1 = time.time()
@@ -550,16 +526,12 @@ class Agent():
                         "iter": self.iter_num,
                         "train/loss": losses['train'],
                         "val/loss": losses['val'],
-                        "train/CE_loss": losses['train_CE_loss'],
-                        "val/CE_loss": losses['val_CE_loss'],
-                        # "train/ece_loss": losses['train_ece_loss'],
-                        # "val/ece_loss": losses['val_ece_loss'],
-                        # "train/sm_ece_loss": losses['train_sm_ece_loss'],
-                        # "val/sm_ece_loss": losses['val_sm_ece_loss'],
-                        "train/ece_loss_multidim": losses['train_ece_loss_multidim'],
-                        "val/ece_loss_multidim": losses['val_ece_loss_multidim'],
-                        "train/sm_ece_loss_multidim": losses['train_sm_ece_loss_multidim'],
-                        "val/sm_ece_loss_multidim": losses['val_sm_ece_loss_multidim'],
+                        # "train/CE_loss": losses['train_CE_loss'],
+                        # "val/CE_loss": losses['val_CE_loss'],
+                        "train/ece_loss_multidim_new": losses['train_ece_loss_multidim_new'],
+                        "val/ece_loss_multidim_new": losses['val_ece_loss_multidim_new'],
+                        "train/sm_ece_loss_multidim_new": losses['train_sm_ece_loss_multidim_new'],
+                        "val/sm_ece_loss_multidim_new": losses['val_sm_ece_loss_multidim_new'],
                         "train/brier_score": losses['train_brier_score'],
                         "val/brier_score": losses['val_brier_score'],
                         "train/zero_one_loss": losses['train_zero_one_loss'],
@@ -568,27 +540,28 @@ class Agent():
                         "val/entropy": losses['val_entropy'],
                         "val/ece_loss_val": losses['val_ece_loss_val'],
                         "val/sm_ece_loss_val": losses['val_sm_ece_loss_val'],
-                        "val/ece_loss_multidim_new": losses['val_ece_loss_multidim_new'],
-                        "val/sm_ece_loss_multidim_new": losses['val_sm_ece_loss_multidim_new'],
                         "lr": lr,
                         "mfu": running_mfu*100, # convert to percentage
                     }
+                    for m in range(0, self.config['m_lookahead']):
+                        log_data.update({
+                            f"train/CE_loss_step{m+1}": losses[f'train_CE_loss_step{m+1}'],
+                            f"val/CE_loss_step{m+1}": losses[f'val_CE_loss_step{m+1}'],
+                        })
                     if self.collaborator_model is not None:
                         log_data.update({
                             # "train/cross_ece_loss": losses['train_cross_ece_loss'],
                             # "val/cross_ece_loss": losses['val_cross_ece_loss'],
                             # "train/sm_cross_ece_loss": losses['train_sm_cross_ece_loss'],
                             # "val/sm_cross_ece_loss": losses['val_sm_cross_ece_loss'],
-                            "train/cross_ece_loss_multidim": losses['train_cross_ece_loss_multidim'],
-                            "val/cross_ece_loss_multidim": losses['val_cross_ece_loss_multidim'],
-                            "train/sm_cross_ece_loss_multidim": losses['train_sm_cross_ece_loss_multidim'],
-                            "val/sm_cross_ece_loss_multidim": losses['val_sm_cross_ece_loss_multidim'],
+                            "train/cross_ece_loss_multidim_new": losses['train_cross_ece_loss_multidim_new'],
+                            "val/cross_ece_loss_multidim_new": losses['val_cross_ece_loss_multidim_new'],
+                            "train/sm_cross_ece_loss_multidim_new": losses['train_sm_cross_ece_loss_multidim_new'],
+                            "val/sm_cross_ece_loss_multidim_new": losses['val_sm_cross_ece_loss_multidim_new'],
                             "train/agreement": losses['train_agreement'],
                             "val/agreement": losses['val_agreement'],
                             "val/cross_ece_loss_val": losses['val_cross_ece_loss_val'],
-                            "val/sm_cross_ece_loss_val": losses['val_sm_cross_ece_loss_val'],
-                            "val/cross_ece_loss_multidim_new": losses['val_cross_ece_loss_multidim_new'],
-                            "val/sm_cross_ece_loss_multidim_new": losses['val_sm_cross_ece_loss_multidim_new'],
+                            "val/sm_cross_ece_loss_val": losses['val_sm_cross_ece_loss_val']
                         })
                     if self.config['datasets'][self.id] == 'maze':
                         log_data.update({
@@ -622,7 +595,7 @@ class Agent():
                     # looking at the source of that context manager, it just toggles this variable
                     self.model.require_backward_grad_sync = (micro_step == self.config['gradient_accumulation_steps'] - 1)
                 with self.ctx:
-                    logits, CE_loss, loss, ece_loss_multidim, sm_ece_loss_multidim, cross_ece_loss_multidim, sm_cross_ece_loss_multidim, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, brier_score, zero_one_loss, entropy, agreement = self.model(X, Y, collaborator_predictions, collaborator_probs)
+                    logits, CE_loss, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, brier_score, zero_one_loss, entropy, agreement = self.model(X, Y, collaborator_predictions, collaborator_probs)
                     loss = loss / self.config['gradient_accumulation_steps'] # scale the loss to account for gradient accumulation
                 # immediately async prefetch next batch while model is doing the forward pass on the GPU
                 X, Y, collaborator_probs = self.get_batch('train')
@@ -680,10 +653,10 @@ class Agent():
                     input_path = os.path.join(self.config['out_dir'], f'input{self.id}_round{self.round}.txt')
                 label_path = os.path.join(self.data_dir, f'input{next_agent_id}_round{0}.txt') # label on original dataset
                 output_path = os.path.join(self.config['out_dir'], f'input{next_agent_id}_round{self.round+1}.txt')
+                print(colored(f"labeling dataset for round {self.round+1} agent {next_agent_id} =================================================", 'light_green'))
                 start_time = time.time()
                 self.label_dataset(input_path, label_path, output_path)
                 end_time = time.time()
-                print(colored(f"created labeled dataset for round {self.round+1} agent {next_agent_id} =================================================", 'light_green'))
                 print(colored(f"time taken: {end_time - start_time:.2f} seconds", 'light_green'))
 
             # termination conditions

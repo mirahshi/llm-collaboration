@@ -13,6 +13,7 @@ from __future__ import annotations
 import random
 from collections import deque
 from typing import Iterator
+import tqdm
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +323,7 @@ def generate_samples(
     rng_seed = random.Random(seed)
     fmt = path_to_directions if path_format == "directions" else path_to_coords
 
-    for _ in range(n):
+    for _ in tqdm.tqdm(range(n)):
         s = rng_seed.randint(0, 2**31)
         if single_path:
             grid, path = generate_maze_single_path(width, height, wall_density, seed=s, shortest_path=shortest_path)

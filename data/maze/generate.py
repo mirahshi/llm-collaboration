@@ -3,18 +3,18 @@ Generate masked maze examples.
 """
 from maze_task import generate_samples
 import time
+import os
 
-def generate(n, width, height, wall_density, all_paths=True, pad_solutions=False, pad_examples=False, mask=True, single_path=False, shortest_path=True):
+def generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths=True, pad_solutions=False, pad_examples=False, mask=True, single_path=False, shortest_path=True):
     examples0 = []
     examples1 = []
-    solution_lengths = []
 
     samples = generate_samples(width=width, height=height, wall_density=wall_density, n=n, all_paths=all_paths, mask=mask, single_path=single_path, shortest_path=shortest_path)
     for data in samples:
-        examples0.extend(data["samples_m1"])
-        examples1.extend(data["samples_m2"])
-        solution_lengths.extend([len(sol) for sol in data["solutions"]])
-    print(f"Generated {len(examples0)} examples")
+        example0 = data["samples_m1"][0] + "*" * (m_lookahead-1)
+        example1 = data["samples_m2"][0] + "*" * (m_lookahead-1)
+        examples0.append(example0)
+        examples1.append(example1)
     
     if pad_solutions:
         max_example_length = max(len(example) for example in examples0)
@@ -28,14 +28,15 @@ def generate(n, width, height, wall_density, all_paths=True, pad_solutions=False
     if pad_examples:
         max_answer_length0 = max(len(example.split("=")[1]) for example in examples0)
         max_answer_length1 = max(len(example.split("=")[1]) for example in examples1)
-        max_answer_length = max(max_answer_length0, max_answer_length1)
+        assert max_answer_length0 == max_answer_length1, "Max answer lengths between datasets are not equal"
+        max_answer_length = max_answer_length0
         print("max answer length:", max_answer_length)
 
         examples0_padded = []
         for example in examples0:
             sol = example.split("=")[1]
             answer_length = len(sol)
-            for i in reversed(range(max_answer_length - answer_length, max_answer_length)):
+            for i in reversed(range(max_answer_length - answer_length, max_answer_length - m_lookahead + 1)):
                 idx = i - (max_answer_length - answer_length)
                 if idx == 0:
                     example_padded = "_" * i + example
@@ -47,7 +48,7 @@ def generate(n, width, height, wall_density, all_paths=True, pad_solutions=False
         for example in examples1:
             sol = example.split("=")[1]
             answer_length = len(sol)
-            for i in reversed(range(max_answer_length - answer_length, max_answer_length)):
+            for i in reversed(range(max_answer_length - answer_length, max_answer_length - m_lookahead + 1)):
                 idx = i - (max_answer_length - answer_length)
                 if idx == 0:
                     example_padded = "_" * i + example
@@ -62,18 +63,26 @@ def generate(n, width, height, wall_density, all_paths=True, pad_solutions=False
     print(f"Generated {len(examples0)} examples after padding")
     
     # save the examples to a file
-    with open("data/maze/input0_round0.txt", "w") as f:
+    with open(os.path.join(out_dir, "input0_round0.txt"), "w") as f:
         for example in examples0:
             f.write(example + "\n")
-    with open("data/maze/input1_round0.txt", "w") as f:
+    with open(os.path.join(out_dir, "input1_round0.txt"), "w") as f:
         for example in examples1:
             f.write(example + "\n")
 
 
 if __name__ == "__main__":
-    n = 100#200000
-    width = 8#6
-    height = 8#6
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate maze examples")
+    parser.add_argument("--out_dir", type=str, help="Output directory")
+    if parser.parse_args().out_dir is None:
+        out_dir = 'data/maze'
+    else:
+        out_dir = parser.parse_args().out_dir
+    
+    n = 100000#200000
+    width = 6#6
+    height = 6#6
     wall_density = 0.30 # each cell has a 30% probability of being a wall
     all_paths = True
     pad_solutions = False
@@ -81,8 +90,9 @@ if __name__ == "__main__":
     mask = True
     single_path = True # generate mazes with only one possible path
     shortest_path = False
+    m_lookahead = 3
     t0 = time.time()
-    generate(n, width, height, wall_density, all_paths, pad_solutions, pad_examples, mask, single_path, shortest_path)
+    generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths, pad_solutions, pad_examples, mask, single_path, shortest_path)
     t1 = time.time()
     print(f"Time taken: {t1 - t0} seconds")
 

@@ -2,7 +2,7 @@ num_agents = 2
 num_rounds = 4
 start_from_round = 0 # which round to start from (begins at 0) 
 save_models = True # save models after each round
-out_dir_suffix = 'scratch'
+out_dir_suffix = 'scratch_lookahead_m1' #'n_layer4'
 
 datasets = ['maze'] * num_agents
 
@@ -25,36 +25,52 @@ confidence = False # use confidence calibration; otherwise use probability calib
 cross_probabilities = True # use collaborator's probabilities for cross calibration
 K = 10 # number of buckets for self ECE
 K_cross = 10 # number of buckets for cross ECE
+compute_smooth_calibration = False # compute smooth calibration losses (memory intensive)
+
 answer_tokens = ['d', 'r', 'u', 'l'] # possible answer tokens
 append_predictions = True # append predictions to output file
 append_probabilities = True # append probabilities to output file
+
+m_lookahead = 1 # number of autoregressive lookahead predictions to generate in one forward pass
+autoregressive_lookahead = True # use autoregressive lookahead (otherwise, use ground truth targets)
 
 # we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False
 
 wandb_run_name = ''
-if confidence:
-    wandb_run_name = wandb_run_name + 'conf'
 if calibrate is not None:
     wandb_run_name = wandb_run_name + f'cal-{calibrate}K{K}K_cross{K_cross}x{multiplier}'
 else:
     wandb_run_name = wandb_run_name + f'nocal-K{K}K_cross{K_cross}'
 if cross_calibrate: 
     wandb_run_name = wandb_run_name + f'crossK{K_cross}x{cross_multiplier}'
-if append_probabilities:
-    wandb_run_name += '-with-probs'
+if m_lookahead > 1:
+    wandb_run_name += f'-m{m_lookahead}'
+    if autoregressive_lookahead:
+        wandb_run_name += 'autoregressive'
 
-# get prefix size and answer length from input.txt
-dataset = datasets[0] # ASSUMING BOTH AGENTS' TASKS ARE IN THE SAME FORMAT
-with open(f'data/{dataset}/input0_round0.txt', 'r') as f:
+import sys
+def _get_cli_arg(name, default):
+    prefix = f"--{name}="
+    for arg in sys.argv[1:]:
+        if arg.startswith(prefix):
+            return arg.split("=", 1)[1]
+    return default
+# override from command line if provided (e.g. --out_dir=out-collab_exp16/n_layer4)
+out_dir = _get_cli_arg("out_dir", out_dir)
+print(f"config out_dir: {out_dir}")
+
+# get prefix size and answer length from input files
+with open(f'{out_dir}/input0_round0.txt', 'r') as f:
     lines = f.readlines()
     example_size = len(lines[0].split('\n')[0]) + 1 # number of characters in the input example (including '\n')
     prefix_size = len(lines[0].split('=')[0]) # number of characters in the input before the '='
+    target_size = len(lines[0].split('=')[1]) - 1 # number of characters in the target (excluding '\n')
+    assert target_size == m_lookahead, f"Target size {target_size} does not match m_lookahead {m_lookahead}"
     print("config example size:", example_size)
-    print("config prefix_size:", prefix_size)
 # check that the prefix size is the same for all agents
 for idx in range(num_agents):
-    with open(f'data/{dataset}/input{idx}_round0.txt', 'r') as f:
+    with open(f'{out_dir}/input{idx}_round0.txt', 'r') as f:
         lines = f.readlines()
         if len(lines[0].split('=')[0]) != prefix_size:
             raise ValueError(f"Prefix size for {dataset} is not the same as the first dataset")
@@ -62,9 +78,10 @@ for idx in range(num_agents):
 gradient_accumulation_steps = 1
 batch_size = 1024
 block_size = prefix_size+1 # 32 # 256 # context of up to 256 previous characters
+print(f"config block size: {block_size}")
 
 # baby GPT model :)
-n_layer = 2 # TODO: TRY MORE LAYERS
+n_layer = 4
 n_head = 6
 n_embd = 240 # 384
 dropout = 0.0 # 0.2
@@ -75,11 +92,7 @@ max_iters = 15000
 lr_decay_iters = max_iters # make equal to max_iters usually
 min_lr = learning_rate / 10 # learning_rate / 10 usually
 beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
-
 warmup_iters = 100 # not super necessary potentially
-
-# wandb_run_name = wandb_run_name + f'-n_embd{n_embd}-dropout{dropout}-lr{learning_rate}-layers{n_layer}'
-# wandb_run_name = wandb_run_name + f'-lr{learning_rate}'
 
 # on macbook also add
 # device = 'cpu'  # run on cpu only

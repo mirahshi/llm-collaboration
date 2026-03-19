@@ -103,5 +103,5 @@ if __name__ == "__main__":
         data_dir = os.path.join('data', datasets[0])
         input_file0 = os.path.join(data_dir, 'input0_round0.txt')
         input_file1 = os.path.join(data_dir, 'input1_round0.txt')
-        prepare(input_file0, '0_round0', save_original_data=True)
-        prepare(input_file1, '1_round0', save_original_data=True)
+        prepare(input_file0, out_dir, '0_round0', save_original_data=True)
+        prepare(input_file1, out_dir, '1_round0', save_original_data=True)
