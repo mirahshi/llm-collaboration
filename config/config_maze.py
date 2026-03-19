@@ -1,5 +1,5 @@
 num_agents = 2
-num_rounds = 4
+num_rounds = 3
 start_from_round = 0 # which round to start from (begins at 0) 
 save_models = True # save models after each round
 out_dir_suffix = 'scratch_lookahead_m1' #'n_layer4'
@@ -91,7 +91,7 @@ dropout = 0.0 # 0.2
 causal = True
 
 learning_rate = 1e-4 # 1e-3 # with baby networks can afford to go a bit higher
-max_iters = 15000
+max_iters = 25000
 lr_decay_iters = max_iters # make equal to max_iters usually
 min_lr = learning_rate / 10 # learning_rate / 10 usually
 beta2 = 0.99 # make a bit bigger because number of tokens per iter is small

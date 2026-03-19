@@ -11,7 +11,7 @@ import numpy as np
 import sys
 from termcolor import colored
 
-from config.config_maze import out_dir, data_dir
+from config.config_maze import out_dir, datasets
 
 
 def prepare(input_file_path, out_dir, file_name_suffix='', save_original_data=False):
@@ -100,6 +100,7 @@ if __name__ == "__main__":
         prepare(input_file, out_dir, suffix, save_original_data=True)
     else:
         # prepare agent 0 and agent 1 input files from data directory
+        data_dir = os.path.join("data", datasets[0])
         input_file0 = os.path.join(data_dir, 'input0_round0.txt')
         input_file1 = os.path.join(data_dir, 'input1_round0.txt')
         prepare(input_file0, out_dir, '0_round0', save_original_data=True)

@@ -5,11 +5,11 @@ from maze_task import generate_samples
 import time
 import os
 
-def generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths=True, pad_solutions=False, pad_examples=False, mask=True, single_path=False, shortest_path=True, last_s_steps=None):
+def generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths=True, pad_solutions=False, pad_examples=False, mask=True, single_path=False, shortest_path=True, seed=42,last_s_steps=None):
     examples0 = []
     examples1 = []
 
-    samples = generate_samples(width=width, height=height, wall_density=wall_density, n=n, all_paths=all_paths, mask=mask, single_path=single_path, shortest_path=shortest_path)
+    samples = generate_samples(width=width, height=height, wall_density=wall_density, n=n, all_paths=all_paths, seed=seed, mask=mask, single_path=single_path, shortest_path=shortest_path)
     for data in samples:
         example0 = data["samples_m1"][0] + "*" * (m_lookahead-1)
         example1 = data["samples_m2"][0] + "*" * (m_lookahead-1)
@@ -82,6 +82,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate maze examples")
     parser.add_argument("--out_dir", type=str, help="Output directory")
     parser.add_argument("--m_lookahead", type=int, help="Number of lookahead steps")
+    parser.add_argument("--seed", type=int, help="Seed for random number generator")
     if parser.parse_args().out_dir is None:
         out_dir = 'data/maze'
     else:
@@ -97,10 +98,11 @@ if __name__ == "__main__":
     mask = True
     single_path = True # generate mazes with only one possible path
     shortest_path = False
+    seed = parser.parse_args().seed if parser.parse_args().seed is not None else 42
     m_lookahead = parser.parse_args().m_lookahead if parser.parse_args().m_lookahead is not None else 1
     last_s_steps = None # generate examples with at most 4 steps to the finish (None to include all steps)
     t0 = time.time()
-    generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths, pad_solutions, pad_examples, mask, single_path, shortest_path, last_s_steps)
+    generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths, pad_solutions, pad_examples, mask, single_path, shortest_path, seed, last_s_steps)
     t1 = time.time()
     print(f"Time taken: {t1 - t0} seconds")
 

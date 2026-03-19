@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for m_lookahead in 2 3 5; do
+for m_lookahead in 1 3 5; do
     if (( m_lookahead > 1 )); then
         for autoregressive_lookahead in True False; do
             wandb_group_name="collab_exp17"
