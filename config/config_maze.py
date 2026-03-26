@@ -1,6 +1,7 @@
 num_agents = 2
-num_rounds = 3
+num_rounds = 4
 start_from_round = 0 # which round to start from (begins at 0) 
+label_starting_round = False # label the starting round dataset using the model of the previous round
 save_models = True # save models after each round
 out_dir_suffix = 'scratch_lookahead_m1' #'n_layer4'
 
@@ -28,10 +29,12 @@ K_cross = 10 # number of buckets for cross ECE
 compute_smooth_calibration = False # compute smooth calibration losses (memory intensive)
 
 answer_tokens = ['d', 'r', 'u', 'l'] # possible answer tokens
-append_predictions = True # append predictions to output file
+append_predictions = False # append predictions to output file (default is sampled predictions unless append_argmax_predictions is True)
+append_argmax_predictions = True # if append_predictions is True, append the argmax prediction instead of the sampled prediction
 append_probabilities = True # append probabilities to output file
+append_probabilities_temperature = 1.0 # temperature for appended probabilities (default is 1)
 
-m_lookahead = 2 # number of autoregressive lookahead predictions to generate in one forward pass
+m_lookahead = 1 # number of autoregressive lookahead predictions to generate in one forward pass
 autoregressive_lookahead = True # use autoregressive lookahead (otherwise, use ground truth targets)
 
 # we expect to overfit on this small dataset, so only save when val improves

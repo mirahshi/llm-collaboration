@@ -56,6 +56,7 @@ wandb_group_name = 'exp'
 num_agents = 1 # 1 or 2
 num_rounds = 1 # number of rounds of conversation
 start_from_round = 0 # start from round 
+label_starting_round = False # label the starting round dataset using the model of the previous round
 save_models = False # save models after each round
 # data
 datasets = ['openwebtext'] * num_agents # one dataset per agent
@@ -79,7 +80,9 @@ m_lookahead = 1 # number of autoregressive lookahead predictions to generate
 autoregressive_lookahead = True # use autoregressive lookahead (otherwise, use ground truth targets)
 answer_tokens = ['0', '1'] # possible answer tokens
 append_predictions = True # append predictions to output file
+append_argmax_predictions = False # if append_predictions is True, append the argmax prediction instead of the sampled prediction
 append_probabilities = True # append probabilities to output file
+append_probabilities_temperature = 1.0 # temperature for appended probabilities (default is 1)
 # model
 n_layer = 12
 n_head = 12
@@ -360,9 +363,20 @@ class Agent():
                 y, probs = self.model.generate(start_ids, max_new_tokens=1, return_probs=True, sample_from_answers=True)
                 # crop outputs to retrieve only the answer token
                 y = y[:, self.block_size:]
-                predictions = [self.decode(y[i].tolist()) for i in range(len(y))]
                 # get probabilities of answer tokens
                 answer_probs = torch.index_select(probs, dim=-1, index=self.answer_indices)
+                if not self.config['append_argmax_predictions']:
+                    # sampled predictions
+                    predictions = [self.decode(y[i].tolist()) for i in range(len(y))]   
+                else:
+                    # argmax predictions
+                    max_indices = torch.argmax(answer_probs, dim=-1)
+                    original_indices = self.answer_indices[max_indices]
+                    predictions = [self.decode(original_indices[i].tolist()) for i in range(len(original_indices))]
+                # apply temperature scaling to communicated probabilities
+                T = self.config['append_probabilities_temperature']
+                answer_probs = torch.softmax(torch.log(answer_probs.clamp_min(1e-12)) / T, dim=-1)
+
                 # round probabilities to 2 decimal places
                 # answer_probs = torch.round(answer_probs, decimals=2)
 
@@ -535,8 +549,16 @@ class Agent():
                 losses = self.estimate_loss()
                 print(f"step {self.iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
                 if self.config['wandb_log']:
+                    # Keep x-axis aligned across runs that start at later rounds.
+                    # Use log step count (not raw iters) so plots align correctly.
+                    evals_per_round = self.config['max_iters'] // self.config['eval_interval']
+                    global_step = self.round * evals_per_round + (self.iter_num // self.config['eval_interval'])
+                    global_iter = self.round * self.config['max_iters'] + self.iter_num
                     log_data = {
-                        "iter": self.iter_num,
+                        "iter": global_iter,
+                        "step": global_step,
+                        "round_iter": self.iter_num,
+                        "round": self.round,
                         "train/loss": losses['train'],
                         "val/loss": losses['val'],
                         # "train/CE_loss": losses['train_CE_loss'],
@@ -580,7 +602,7 @@ class Agent():
                         log_data.update({
                             "val/maze_success_rate": losses['val_maze_success_rate'],
                         })
-                    wandb.log(log_data)
+                    wandb.log(log_data, step=global_step)
 
                 if losses['val'] < self.best_val_loss or self.config['always_save_checkpoint']:
                     self.best_val_loss = losses['val']
@@ -714,6 +736,30 @@ def load_model(round, agent_id):
     print(colored(f"loaded checkpoint from {ckpt_path}", 'light_green'))
     return model
 
+def label_starting_round_dataset(config, round, agent_id, model):
+    """
+    Label the starting round dataset for the next round and next agent, using given model.
+    """
+    next_agent_id = (agent_id + 1) % config['num_agents']
+    input_path = os.path.join(config['out_dir'], f'input{agent_id}_round{round}.txt')
+    label_path = os.path.join(config['out_dir'], f'input{next_agent_id}_round{0}.txt')
+    output_path = os.path.join(config['out_dir'], f'input{next_agent_id}_round{round+1}.txt')
+
+    # Build an Agent wrapper for round-specific shapes/tokenization and reuse the loaded GPT model.
+    # For rounds > 0 the data includes collaborator annotations, so pass a non-None placeholder.
+    label_config = dict(config)
+    label_config['compile'] = False
+    collaborator_placeholder = model if round > 0 else None
+    labeler = Agent(label_config, round, agent_id, collaborator_placeholder)
+    labeler.model = model
+    labeler.model.eval()
+
+    print(colored(f"labeling starting round dataset for round {round+1} agent {next_agent_id} =================================================", 'light_green'))
+    start_time = time.time()
+    labeler.label_dataset(input_path, label_path, output_path)
+    end_time = time.time()    
+    print(colored(f"time taken: {end_time - start_time:.2f} seconds", 'light_green'))
+
 
 def train_converse(config):
     """Iteratively train agents using collaborator models."""
@@ -730,6 +776,8 @@ def train_converse(config):
         elif r == config['start_from_round']-1:
             current_model = load_model(r, agent_id)
             print(colored(f"Round {r}: loaded agent {agent_id} model ==========================================", 'light_yellow'))
+            if config['label_starting_round']:
+                label_starting_round_dataset(config, r, agent_id, current_model)
         else:
             print(colored(f"Round {r}: agent {agent_id} trains =================================================", 'light_yellow'))
             
