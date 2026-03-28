@@ -97,6 +97,22 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class CalibrateMLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        dim = len(config.answer_tokens)
+        self.c_fc    = nn.Linear(dim * 2, 8 * dim, bias=config.bias)
+        self.gelu    = nn.GELU()
+        self.c_out   = nn.Linear(8 * dim, dim, bias=config.bias)
+
+    def forward(self, p1, p2):
+        x = torch.cat((p1, p2), dim=-1)
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_out(x)
+        return x
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -133,6 +149,8 @@ class GPTConfig:
     K: int = 5 # number of buckets for self ECE
     K_cross: int = 5 # number of buckets for cross ECE
     compute_smooth_calibration: bool = False # compute smooth calibration losses (memory intensive)
+    post_hoc_calibrate: bool = False # post-hoc calibrate the model using the predictions of the previous round
+    post_hoc_calibrate_multiplier: float = 1.0 # multiplier for post-hoc cross calibration loss
     m_lookahead: int = 1 # number of autoregressive lookahead predictions to generate
     autoregressive_lookahead: bool = True # use autoregressive lookahead (otherwise, use ground truth targets)
     answer_tokens: list = field(default_factory=lambda: [''])
@@ -169,6 +187,9 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+        # init post-hoc calibrate MLP
+        self.calibrate_mlp = CalibrateMLP(config)
 
     def get_num_params(self, non_embedding=True):
         """
@@ -690,10 +711,42 @@ class GPT(nn.Module):
                 
                 if self.config.cross_calibrate:
                     loss = loss + sm_cross_ece_loss_multidim_new * self.config.cross_multiplier
+                
+                if self.config.post_hoc_calibrate:
+                    answer_probs = answer_probs.detach()
+                    # feed own probabilities and collaborator probabilities to CalibrateMLP to get conversation calibrated probabilities
+                    calibrator_logits = self.calibrate_mlp(answer_probs, collaborator_probs)
+                    calibrator_probs = F.softmax(calibrator_logits, dim=-1)
+                    calibrator_sm_cross_ece_loss = self.ECE_multidim_new(calibrator_probs, labels, K=self.config.K, K_cross=self.config.K_cross, smooth=True, sigma=0.1, collaborator_probs=collaborator_probs, confidence=self.config.confidence)
+
+                    loss = loss + calibrator_sm_cross_ece_loss * self.config.post_hoc_calibrate_multiplier
+
+                    with torch.no_grad():
+                        calibrator_cross_ece_loss = self.ECE_multidim_new(calibrator_probs, labels, K=self.config.K, K_cross=self.config.K_cross, smooth=False, sigma=0.1, collaborator_probs=collaborator_probs, confidence=self.config.confidence)
+                        calibrator_ece_loss = self.ECE_multidim_new(calibrator_probs, labels, K=self.config.K, K_cross=self.config.K_cross, smooth=False, sigma=0.1, confidence=self.config.confidence)
+                        calibrator_entropy = self.entropy(calibrator_logits)
+                        calibrator_agreement = self.agreement(calibrator_probs, collaborator_probs)
+                        targets_answer_idx = labels.int().argmax(dim=-1)
+                        calibrator_zero_one_loss = self.zero_one_loss(calibrator_logits, targets_answer_idx)
+                else:
+                    calibrator_logits = None
+                    calibrator_sm_cross_ece_loss = None
+                    calibrator_cross_ece_loss = None
+                    calibrator_ece_loss = None
+                    calibrator_entropy = None
+                    calibrator_agreement = None
+                    calibrator_zero_one_loss = None
             else:
                 cross_ece_loss_multidim_new = None
                 sm_cross_ece_loss_multidim_new = None
                 agreement = None
+                calibrator_logits = None
+                calibrator_sm_cross_ece_loss = None
+                calibrator_cross_ece_loss = None
+                calibrator_ece_loss = None
+                calibrator_entropy = None
+                calibrator_agreement = None
+                calibrator_zero_one_loss = None
             
             if use_sm_ece:
                 loss = loss + sm_ece_loss_multidim_new * self.config.multiplier
@@ -713,8 +766,23 @@ class GPT(nn.Module):
             sm_ece_loss_multidim_new = None
             cross_ece_loss_multidim_new = None
             sm_cross_ece_loss_multidim_new = None
+            calibrator_sm_cross_ece_loss = None
+            calibrator_cross_ece_loss = None
+            calibrator_ece_loss = None
+            calibrator_entropy = None
+            calibrator_agreement = None
+            calibrator_zero_one_loss = None
+            
+            # compute calibrator_logits for inference if post_hoc_calibrate is enabled and collaborator_probs provided
+            if self.config.post_hoc_calibrate and collaborator_probs is not None:
+                probs = F.softmax(logits, dim=-1)
+                answer_indices = torch.tensor([self.config.stoi[token] for token in self.config.answer_tokens], device=device)
+                answer_probs = torch.index_select(probs, dim=-1, index=answer_indices)
+                calibrator_logits = self.calibrate_mlp(answer_probs, collaborator_probs)
+            else:
+                calibrator_logits = None
 
-        return logits, CE_loss_sequence, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, brier_score, zero_one_loss, entropy, agreement
+        return logits, calibrator_logits, CE_loss_sequence, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, calibrator_sm_cross_ece_loss, calibrator_cross_ece_loss, calibrator_ece_loss, calibrator_entropy, calibrator_agreement, calibrator_zero_one_loss, brier_score, zero_one_loss, entropy, agreement
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -827,7 +895,7 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, return_probs=False, sample_from_answers=False):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, return_probs=False, sample_from_answers=False, use_calibrator_logits=False, collaborator_probs=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -838,7 +906,10 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _, _, _, _, _, _, _, _, _, _ = self(idx_cond)
+            logits, calibrator_logits, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ = self(idx_cond, collaborator_probs=collaborator_probs)
+            if use_calibrator_logits:
+                assert calibrator_logits is not None, "calibrator_logits must be provided when use_calibrator_logits is True"
+                logits = calibrator_logits
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -848,10 +919,14 @@ class GPT(nn.Module):
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
             probs_list.append(probs)
-            if sample_from_answers:
+            answer_indices = torch.tensor([self.config.stoi[token] for token in self.config.answer_tokens], device=idx.device)
+            if sample_from_answers: 
                 # sample from only the answer tokens
-                answer_indices = torch.tensor([self.config.stoi[token] for token in self.config.answer_tokens], device=idx.device)
-                probs = torch.index_select(probs, dim=-1, index=answer_indices)
+                probs_answer = torch.index_select(probs, dim=-1, index=answer_indices)
+                idx_next = torch.multinomial(probs_answer, num_samples=1)
+                idx_next = answer_indices[idx_next]
+            elif use_calibrator_logits:
+                # calibrator_logits are already for answer tokens only, so sample and convert back to vocab indices
                 idx_next = torch.multinomial(probs, num_samples=1)
                 idx_next = answer_indices[idx_next]
             else:

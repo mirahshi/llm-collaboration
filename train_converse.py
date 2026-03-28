@@ -76,6 +76,8 @@ cross_probabilities = True # use collaborator's probabilities for cross calibrat
 K = 5 # number of buckets for self ECE
 K_cross = 5 # number of buckets for cross ECE
 compute_smooth_calibration = False # compute smooth calibration losses (memory intensive)
+post_hoc_calibrate = False # post-hoc cross calibrate the model using the predictions of the previous round
+post_hoc_calibrate_multiplier = 1.0 # multiplier for post-hoc cross calibration loss
 m_lookahead = 1 # number of autoregressive lookahead predictions to generate
 autoregressive_lookahead = True # use autoregressive lookahead (otherwise, use ground truth targets)
 answer_tokens = ['0', '1'] # possible answer tokens
@@ -215,7 +217,10 @@ class Agent():
         # model init
         self.model_args = dict(n_layer=self.config['n_layer'], n_head=self.config['n_head'], n_embd=self.config['n_embd'], block_size=self.block_size,
                         bias=self.config['bias'], vocab_size=None, stoi=self.meta_stoi, itos=self.meta_itos, dropout=self.config['dropout'], prefix_size=self.prefix_size, example_size=self.example_size, calibrate=self.config['calibrate'], multiplier=self.config['multiplier'], 
-                        cross_calibrate=self.config['cross_calibrate'], cross_multiplier=self.config['cross_multiplier'], confidence=self.config['confidence'], causal=self.config['causal'], cross_probabilities=self.config['cross_probabilities'], K=self.config['K'], K_cross=self.config['K_cross'], compute_smooth_calibration=self.config['compute_smooth_calibration'], m_lookahead=self.config['m_lookahead'], autoregressive_lookahead=self.config['autoregressive_lookahead'], answer_tokens=self.config['answer_tokens']) # start with model_args from command line
+                        cross_calibrate=self.config['cross_calibrate'], cross_multiplier=self.config['cross_multiplier'], confidence=self.config['confidence'], causal=self.config['causal'], cross_probabilities=self.config['cross_probabilities'], 
+                        K=self.config['K'], K_cross=self.config['K_cross'], compute_smooth_calibration=self.config['compute_smooth_calibration'], m_lookahead=self.config['m_lookahead'], 
+                        autoregressive_lookahead=self.config['autoregressive_lookahead'], answer_tokens=self.config['answer_tokens'], 
+                        post_hoc_calibrate=self.config['post_hoc_calibrate'], post_hoc_calibrate_multiplier=self.config['post_hoc_calibrate_multiplier']) # start with model_args from command line
 
         
         if self.config['init_from'] == 'scratch':
@@ -360,11 +365,22 @@ class Agent():
                 starts = [input_line[:self.block_size] for input_line in input_lines]
                 start_ids = [self.encode(start) for start in starts]
                 start_ids = torch.tensor(start_ids, dtype=torch.long, device=self.config['device'])
-                y, probs = self.model.generate(start_ids, max_new_tokens=1, return_probs=True, sample_from_answers=True)
+                if self.config['post_hoc_calibrate'] and self.collaborator_model is not None:
+                    # extract collaborator_probs from input file for this batch (collaborator probs are in input file, not label file)
+                    delimiter = ';'
+                    collaborator_probs_list = [line.split(delimiter)[-1] for line in input_lines]
+                    collaborator_probs_list = [ast.literal_eval(prob) for prob in collaborator_probs_list]
+                    collaborator_probs = torch.tensor(collaborator_probs_list, device=self.config['device'], dtype=torch.float32)
+                    collaborator_probs = collaborator_probs.unsqueeze(1)  # shape (B, 1, num_answer_tokens)
+                    y, probs = self.model.generate(start_ids, max_new_tokens=1, return_probs=True, sample_from_answers=False, use_calibrator_logits=True, collaborator_probs=collaborator_probs)
+                    answer_probs = probs
+                else:
+                    y, probs = self.model.generate(start_ids, max_new_tokens=1, return_probs=True, sample_from_answers=True)
+                    # get probabilities of answer tokens
+                    answer_probs = torch.index_select(probs, dim=-1, index=self.answer_indices)
                 # crop outputs to retrieve only the answer token
                 y = y[:, self.block_size:]
-                # get probabilities of answer tokens
-                answer_probs = torch.index_select(probs, dim=-1, index=self.answer_indices)
+                
                 if not self.config['append_argmax_predictions']:
                     # sampled predictions
                     predictions = [self.decode(y[i].tolist()) for i in range(len(y))]   
@@ -423,7 +439,20 @@ class Agent():
                 starts = [example[:self.block_size] for example in maze_lines]
                 start_ids = [self.encode(start) for start in starts]
                 start_ids = torch.tensor(start_ids, dtype=torch.long, device=self.config['device'])
-                y, _ = self.model.generate(start_ids, max_new_tokens=1, return_probs=True, sample_from_answers=True)
+                if self.config['post_hoc_calibrate'] and self.collaborator_model is not None:
+                    # extract collaborator_probs from input lines for this batch
+                    if i == len(maze_starting_indices) - 1:
+                        collab_lines = lines[maze_starting_indices[i]:]
+                    else:
+                        collab_lines = lines[maze_starting_indices[i]:maze_starting_indices[i+1]]
+                    delimiter = ';'
+                    collaborator_probs_list = [line.split(delimiter)[-1] for line in collab_lines]
+                    collaborator_probs_list = [ast.literal_eval(prob) for prob in collaborator_probs_list]
+                    collaborator_probs = torch.tensor(collaborator_probs_list, device=self.config['device'], dtype=torch.float32)
+                    collaborator_probs = collaborator_probs.unsqueeze(1)  # shape (B, 1, num_answer_tokens)
+                    y, _ = self.model.generate(start_ids, max_new_tokens=1, return_probs=True, sample_from_answers=False, use_calibrator_logits=True, collaborator_probs=collaborator_probs)
+                else:
+                    y, _ = self.model.generate(start_ids, max_new_tokens=1, return_probs=True, sample_from_answers=True)
                 # crop outputs to retrieve only the answer token
                 y = y[:, self.block_size:]
                 predictions = [self.decode(y[i].tolist()) for i in range(len(y))]
@@ -448,6 +477,20 @@ class Agent():
             if self.collaborator_model is not None:
                 cross_ece_loss_multidims_new = torch.zeros(self.config['eval_iters'])
                 sm_cross_ece_loss_multidims_new = torch.zeros(self.config['eval_iters'])
+                if self.config['post_hoc_calibrate']:
+                    calibrator_sm_cross_ece_losses = torch.zeros(self.config['eval_iters'])
+                    calibrator_cross_ece_losses = torch.zeros(self.config['eval_iters'])
+                    calibrator_ece_losses = torch.zeros(self.config['eval_iters'])
+                    calibrator_entropies = torch.zeros(self.config['eval_iters'])
+                    calibrator_agreements = torch.zeros(self.config['eval_iters'])
+                    calibrator_zero_one_losses = torch.zeros(self.config['eval_iters'])
+                else:
+                    calibrator_sm_cross_ece_losses = None
+                    calibrator_cross_ece_losses = None
+                    calibrator_ece_losses = None
+                    calibrator_entropies = None
+                    calibrator_agreements = None
+                    calibrator_zero_one_losses = None
             brier_scores = torch.zeros(self.config['eval_iters'])
             zero_one_losses = torch.zeros(self.config['eval_iters'])
             entropies = torch.zeros(self.config['eval_iters'])
@@ -457,7 +500,7 @@ class Agent():
                 collaborator_predictions = None
 
                 with self.ctx:
-                    logits, CE_loss_sequence, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, brier_score, zero_one_loss, entropy, agreement = self.model(X, Y, collaborator_predictions, collaborator_probs) # call foward function
+                    logits, calibrator_logits, CE_loss_sequence, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, calibrator_sm_cross_ece_loss, calibrator_cross_ece_loss, calibrator_ece_loss, calibrator_entropy, calibrator_agreement, calibrator_zero_one_loss, brier_score, zero_one_loss, entropy, agreement = self.model(X, Y, collaborator_predictions, collaborator_probs) # call foward function
                 # CE_losses[k] = CE_loss.item()
                 for m in range(0, self.config['m_lookahead']):
                     CE_loss_sequences[m][k] = CE_loss_sequence[m].item()
@@ -468,6 +511,13 @@ class Agent():
                     cross_ece_loss_multidims_new[k] = cross_ece_loss_multidim_new.item()
                     sm_cross_ece_loss_multidims_new[k] = sm_cross_ece_loss_multidim_new.item()
                     agreements[k] = agreement.item()
+                    if self.config['post_hoc_calibrate']:
+                        calibrator_sm_cross_ece_losses[k] = calibrator_sm_cross_ece_loss.item()
+                        calibrator_cross_ece_losses[k] = calibrator_cross_ece_loss.item()
+                        calibrator_ece_losses[k] = calibrator_ece_loss.item()
+                        calibrator_entropies[k] = calibrator_entropy.item()
+                        calibrator_agreements[k] = calibrator_agreement.item()
+                        calibrator_zero_one_losses[k] = calibrator_zero_one_loss.item()
                 brier_scores[k] = brier_score.item()
                 zero_one_losses[k] = zero_one_loss.item()
                 entropies[k] = entropy.item()
@@ -481,6 +531,13 @@ class Agent():
                 out[split + '_cross_ece_loss_multidim_new'] = cross_ece_loss_multidims_new.mean()
                 out[split + '_sm_cross_ece_loss_multidim_new'] = sm_cross_ece_loss_multidims_new.mean()
                 out[split + '_agreement'] = agreements.mean()
+                if self.config['post_hoc_calibrate']:
+                    out[split + '_calibrator_sm_cross_ece_loss'] = calibrator_sm_cross_ece_losses.mean()
+                    out[split + '_calibrator_cross_ece_loss'] = calibrator_cross_ece_losses.mean()
+                    out[split + '_calibrator_ece_loss'] = calibrator_ece_losses.mean()
+                    out[split + '_calibrator_entropy'] = calibrator_entropies.mean()
+                    out[split + '_calibrator_agreement'] = calibrator_agreements.mean()
+                    out[split + '_calibrator_zero_one_loss'] = calibrator_zero_one_losses.mean()
             out[split + '_brier_score'] = brier_scores.mean()
             out[split + '_zero_one_loss'] = zero_one_losses.mean()
             out[split + '_entropy'] = entropies.mean()
@@ -490,7 +547,7 @@ class Agent():
         X_val, Y_val, collaborator_probs_val = self.get_batch('val', num_examples=10000)
         collaborator_predictions_val = None
         with self.ctx:
-            _,_,_,ece_loss_multidim_val_new, sm_ece_loss_multidim_val_new, cross_ece_loss_multidim_val_new, sm_cross_ece_loss_multidim_val_new,_,_,_,_ = self.model(X_val, Y_val, collaborator_predictions_val, collaborator_probs_val)
+            _,_,_,_,ece_loss_multidim_val_new, sm_ece_loss_multidim_val_new, cross_ece_loss_multidim_val_new, sm_cross_ece_loss_multidim_val_new,_,_,_,_,_,_,_,_,_,_ = self.model(X_val, Y_val, collaborator_predictions_val, collaborator_probs_val)
         ece_loss_val = ece_loss_multidim_val_new.item()
         sm_ece_loss_val = sm_ece_loss_multidim_val_new.item()
         out['val_ece_loss_val'] = ece_loss_val
@@ -551,7 +608,8 @@ class Agent():
                 if self.config['wandb_log']:
                     # Keep x-axis aligned across runs that start at later rounds.
                     # Use log step count (not raw iters) so plots align correctly.
-                    evals_per_round = self.config['max_iters'] // self.config['eval_interval']
+                    # +1 because we eval at both iter_num=0 and iter_num=max_iters
+                    evals_per_round = (self.config['max_iters'] // self.config['eval_interval']) + 1
                     global_step = self.round * evals_per_round + (self.iter_num // self.config['eval_interval'])
                     global_iter = self.round * self.config['max_iters'] + self.iter_num
                     log_data = {
@@ -598,6 +656,21 @@ class Agent():
                             "val/cross_ece_loss_val": losses['val_cross_ece_loss_val'],
                             "val/sm_cross_ece_loss_val": losses['val_sm_cross_ece_loss_val']
                         })
+                        if self.config['post_hoc_calibrate']:
+                            log_data.update({
+                                "train/calibrator_sm_cross_ece_loss": losses['train_calibrator_sm_cross_ece_loss'],
+                                "val/calibrator_sm_cross_ece_loss": losses['val_calibrator_sm_cross_ece_loss'],
+                                "train/calibrator_cross_ece_loss": losses['train_calibrator_cross_ece_loss'],
+                                "val/calibrator_cross_ece_loss": losses['val_calibrator_cross_ece_loss'],
+                                "train/calibrator_ece_loss": losses['train_calibrator_ece_loss'],
+                                "val/calibrator_ece_loss": losses['val_calibrator_ece_loss'],
+                                "train/calibrator_entropy": losses['train_calibrator_entropy'],
+                                "val/calibrator_entropy": losses['val_calibrator_entropy'],
+                                "train/calibrator_agreement": losses['train_calibrator_agreement'],
+                                "val/calibrator_agreement": losses['val_calibrator_agreement'],
+                                "train/calibrator_zero_one_loss": losses['train_calibrator_zero_one_loss'],
+                                "val/calibrator_zero_one_loss": losses['val_calibrator_zero_one_loss'],
+                            })
                     if self.config['datasets'][self.id] == 'maze':
                         log_data.update({
                             "val/maze_success_rate": losses['val_maze_success_rate'],
@@ -630,7 +703,7 @@ class Agent():
                     # looking at the source of that context manager, it just toggles this variable
                     self.model.require_backward_grad_sync = (micro_step == self.config['gradient_accumulation_steps'] - 1)
                 with self.ctx:
-                    logits, CE_loss, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, brier_score, zero_one_loss, entropy, agreement = self.model(X, Y, collaborator_predictions, collaborator_probs)
+                    logits, calibrator_logits, CE_loss, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, calibrator_sm_cross_ece_loss, calibrator_cross_ece_loss, calibrator_ece_loss, calibrator_entropy, calibrator_agreement, calibrator_zero_one_loss, brier_score, zero_one_loss, entropy, agreement = self.model(X, Y, collaborator_predictions, collaborator_probs)
                     loss = loss / self.config['gradient_accumulation_steps'] # scale the loss to account for gradient accumulation
                 # immediately async prefetch next batch while model is doing the forward pass on the GPU
                 X, Y, collaborator_probs = self.get_batch('train')
