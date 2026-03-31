@@ -28,7 +28,7 @@ K = 5 # number of buckets for self ECE
 K_cross = 5 # number of buckets for cross ECE
 compute_smooth_calibration = False # compute smooth calibration losses (memory intensive)
 
-post_hoc_calibrate = True # post-hoc cross calibrate the model using the predictions of the previous round
+post_hoc_calibrate = False # post-hoc cross calibrate the model using the predictions of the previous round
 post_hoc_calibrate_multiplier = 1.0 # multiplier for post-hoc cross calibration loss
 
 answer_tokens = ['d', 'r', 'u', 'l'] # possible answer tokens
@@ -39,6 +39,8 @@ append_probabilities_temperature = 1.0 # temperature for appended probabilities 
 
 m_lookahead = 1 # number of autoregressive lookahead predictions to generate in one forward pass
 autoregressive_lookahead = True # use autoregressive lookahead (otherwise, use ground truth targets)
+
+prune_dataset = True # prune the dataset after each round to remove examples that are correct with 100% confidence
 
 # we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False
