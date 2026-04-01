@@ -911,7 +911,7 @@ def train_converse(config):
     
     # Initialize wandb early so logging works during label_starting_round
     if config['wandb_log'] and master_process:
-        wandb.init(project=config['wandb_project'], group=config['wandb_group_name'], name=config['wandb_run_name'], config=config)
+        wandb.init(entity="mirahshi-university-of-pennsylvania",project=config['wandb_project'], group=config['wandb_group_name'], name=config['wandb_run_name'], config=config)
     
     for r in range(config['num_rounds']):
         
