@@ -84,6 +84,7 @@ answer_tokens = ['0', '1'] # possible answer tokens
 append_predictions = True # append predictions to output file
 append_argmax_predictions = False # if append_predictions is True, append the argmax prediction instead of the sampled prediction
 append_probabilities = True # append probabilities to output file
+append_probabilities_precision = 2 # decimal places for appended probabilities
 append_probabilities_temperature = 1.0 # temperature for appended probabilities (default is 1)
 prune_dataset = False # prune the dataset after each round to remove examples that are correct with 100% confidence
 # model
@@ -209,9 +210,10 @@ class Agent():
                 self.example_size += 2
             if self.config['append_probabilities']:
                 num_answer_tokens = len(self.config['answer_tokens'])
-                self.prefix_size += num_answer_tokens * 5 # probabilities (rounded to 2 decimal places) and delimiters
-                self.block_size += num_answer_tokens * 5
-                self.example_size += num_answer_tokens * 5
+                tokens_per_answer = 3 + self.config['append_probabilities_precision'] # e.g. 0.85,
+                self.prefix_size += num_answer_tokens * tokens_per_answer
+                self.block_size += num_answer_tokens * tokens_per_answer
+                self.example_size += num_answer_tokens * tokens_per_answer
         print(f"prefix size: {self.prefix_size}, block size: {self.block_size}, example size: {self.example_size}")
         assert self.block_size == self.prefix_size + 1, f"block size {self.block_size} is not equal to prefix size {self.prefix_size} + 1"
         
@@ -220,7 +222,7 @@ class Agent():
                         bias=self.config['bias'], vocab_size=None, stoi=self.meta_stoi, itos=self.meta_itos, dropout=self.config['dropout'], prefix_size=self.prefix_size, example_size=self.example_size, calibrate=self.config['calibrate'], multiplier=self.config['multiplier'], 
                         cross_calibrate=self.config['cross_calibrate'], cross_multiplier=self.config['cross_multiplier'], confidence=self.config['confidence'], causal=self.config['causal'], cross_probabilities=self.config['cross_probabilities'], 
                         K=self.config['K'], K_cross=self.config['K_cross'], compute_smooth_calibration=self.config['compute_smooth_calibration'], m_lookahead=self.config['m_lookahead'], 
-                        autoregressive_lookahead=self.config['autoregressive_lookahead'], answer_tokens=self.config['answer_tokens'], 
+                        autoregressive_lookahead=self.config['autoregressive_lookahead'], answer_tokens=self.config['answer_tokens'], append_probabilities_temperature=self.config['append_probabilities_temperature'],
                         post_hoc_calibrate=self.config['post_hoc_calibrate'], post_hoc_calibrate_multiplier=self.config['post_hoc_calibrate_multiplier']) # start with model_args from command line
 
         
@@ -253,7 +255,20 @@ class Agent():
             for k,v in list(state_dict.items()):
                 if k.startswith(unwanted_prefix):
                     state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-            self.model.load_state_dict(state_dict)
+            incompatible = self.model.load_state_dict(state_dict, strict=False)
+            missing_keys = list(incompatible.missing_keys)
+            unexpected_keys = list(incompatible.unexpected_keys)
+            # Backward compatibility: older checkpoints may not have calibrator weights.
+            allowed_missing_prefixes = ("calibrate_mlp.",)
+            disallowed_missing = [k for k in missing_keys if not k.startswith(allowed_missing_prefixes)]
+            if disallowed_missing or unexpected_keys:
+                raise RuntimeError(
+                    f"Error(s) in loading state_dict for GPT:\n"
+                    f"  Missing key(s): {disallowed_missing}\n"
+                    f"  Unexpected key(s): {unexpected_keys}"
+                )
+            if missing_keys:
+                print(colored(f"ignoring missing checkpoint keys: {missing_keys}", "light_yellow"))
             self.iter_num = checkpoint['iter_num']
             self.best_val_loss = checkpoint['best_val_loss']
         elif self.config['init_from'].startswith('gpt2'):
@@ -400,14 +415,13 @@ class Agent():
                     predictions = [self.decode(original_indices[i].tolist()) for i in range(len(original_indices))]
                 # apply temperature scaling to communicated probabilities
                 T = self.config['append_probabilities_temperature']
-                answer_probs = torch.softmax(torch.log(answer_probs.clamp_min(1e-12)) / T, dim=-1)
-
-                # round probabilities to 2 decimal places
-                # answer_probs = torch.round(answer_probs, decimals=2)
+                answer_probs_scaled = torch.softmax(torch.log(answer_probs.clamp_min(1e-12)) / T, dim=-1)
+                if T == 1.0:
+                    assert torch.allclose(answer_probs, answer_probs_scaled), f"answer_probs and answer_probs_scaled are not the same when T = 1.0:\nanswer_probs = {answer_probs}\nanswer_probs_scaled = {answer_probs_scaled}"
 
                 # write predictions to label file
                 label_lines = f_label_lines[start_line_idx:start_line_idx + batch_size]
-                for i, (label_line, prediction, prob) in enumerate(zip(label_lines, predictions, answer_probs)):
+                for i, (label_line, prediction, prob, prob_scaled) in enumerate(zip(label_lines, predictions, answer_probs, answer_probs_scaled)):
                     remove_example = False
                     if self.config['prune_dataset']:
                     # if answer_probs has prob 1 on the correct answer, skip it
@@ -424,14 +438,14 @@ class Agent():
                             output_line = f"{prediction},{output_line}"
                         if self.config['append_probabilities']:
                             # prob is a list. convert prob to a string without brackets and join elemets with commas
-                            # round probabilities to 2 decimal places
-                            prob_string = ','.join(f"{p:.2f}" for p in prob[0].tolist())
+                            # round probabilities to specified number of decimal places
+                            prob_string = ','.join(f"{p:.{self.config['append_probabilities_precision']}f}" for p in prob_scaled[0].tolist())
                             output_line = f"{prob_string},{output_line}"
-                        out.write(f"{output_line};{prob[0].tolist()}\n")   
+                        out.write(f"{output_line};{prob[0].tolist()};{prob_scaled[0].tolist()}\n")   
                         # out.write(f"{prob[0].tolist()};{prediction};{label_line}\n")
                         if self.config['prune_dataset'] and not remove_example:
                             with open(output_path_pruned, "a", encoding="utf-8") as out_pruned:
-                                out_pruned.write(f"{output_line};{prob[0].tolist()}\n")
+                                out_pruned.write(f"{output_line};{prob[0].tolist()};{prob_scaled[0].tolist()}\n")
             if self.config['prune_dataset']:
                 num_examples = len(f_label_lines)
                 # print number of examples in output file after pruning
@@ -449,8 +463,7 @@ class Agent():
         if self.config['prune_dataset']:
             file_name_suffix_pruned = file_name_suffix + '_pruned'
             prepare(output_path_pruned, self.config['out_dir'], file_name_suffix_pruned)
-    
-    
+ 
     @torch.no_grad()
     def maze_success_rate(self, num_mazes=1000):
         with open(os.path.join(self.data_dir, f'input{self.id}_round{self.round}.txt'), 'r') as input_file:
@@ -509,6 +522,7 @@ class Agent():
             CE_loss_sequences = [torch.zeros(self.config['eval_iters']) for m in range(0, self.config['m_lookahead'])]
             ece_loss_multidims_new = torch.zeros(self.config['eval_iters'])
             sm_ece_loss_multidims_new = torch.zeros(self.config['eval_iters'])
+            ece_loss_temperatures_scaled = torch.zeros(self.config['eval_iters'])
             if self.collaborator_model is not None:
                 cross_ece_loss_multidims_new = torch.zeros(self.config['eval_iters'])
                 sm_cross_ece_loss_multidims_new = torch.zeros(self.config['eval_iters'])
@@ -535,13 +549,14 @@ class Agent():
                 collaborator_predictions = None
 
                 with self.ctx:
-                    logits, calibrator_logits, CE_loss_sequence, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, calibrator_sm_cross_ece_loss, calibrator_cross_ece_loss, calibrator_ece_loss, calibrator_entropy, calibrator_agreement, calibrator_zero_one_loss, brier_score, zero_one_loss, entropy, agreement = self.model(X, Y, collaborator_predictions, collaborator_probs) # call foward function
+                    logits, calibrator_logits, CE_loss_sequence, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, calibrator_sm_cross_ece_loss, calibrator_cross_ece_loss, calibrator_ece_loss, calibrator_entropy, calibrator_agreement, calibrator_zero_one_loss, brier_score, zero_one_loss, entropy, agreement, ece_loss_temperature_scaled = self.model(X, Y, collaborator_predictions, collaborator_probs) # call foward function
                 # CE_losses[k] = CE_loss.item()
                 for m in range(0, self.config['m_lookahead']):
                     CE_loss_sequences[m][k] = CE_loss_sequence[m].item()
                 losses[k] = loss.item()
                 ece_loss_multidims_new[k] = ece_loss_multidim_new.item()
                 sm_ece_loss_multidims_new[k] = sm_ece_loss_multidim_new.item()
+                ece_loss_temperatures_scaled[k] = ece_loss_temperature_scaled.item()
                 if self.collaborator_model is not None:
                     cross_ece_loss_multidims_new[k] = cross_ece_loss_multidim_new.item()
                     sm_cross_ece_loss_multidims_new[k] = sm_cross_ece_loss_multidim_new.item()
@@ -562,6 +577,7 @@ class Agent():
                 out[split + f'_CE_loss_step{m+1}'] = CE_loss_sequences[m].mean()
             out[split + '_ece_loss_multidim_new'] = ece_loss_multidims_new.mean()
             out[split + '_sm_ece_loss_multidim_new'] = sm_ece_loss_multidims_new.mean()
+            out[split + '_ece_loss_temperature_scaled'] = ece_loss_temperatures_scaled.mean()
             if self.collaborator_model is not None:
                 out[split + '_cross_ece_loss_multidim_new'] = cross_ece_loss_multidims_new.mean()
                 out[split + '_sm_cross_ece_loss_multidim_new'] = sm_cross_ece_loss_multidims_new.mean()
@@ -582,7 +598,7 @@ class Agent():
         X_val, Y_val, collaborator_probs_val = self.get_batch('val', num_examples=10000)
         collaborator_predictions_val = None
         with self.ctx:
-            _,_,_,_,ece_loss_multidim_val_new, sm_ece_loss_multidim_val_new, cross_ece_loss_multidim_val_new, sm_cross_ece_loss_multidim_val_new,_,_,_,_,_,_,_,_,_,_ = self.model(X_val, Y_val, collaborator_predictions_val, collaborator_probs_val)
+            _,_,_,_,ece_loss_multidim_val_new, sm_ece_loss_multidim_val_new, cross_ece_loss_multidim_val_new, sm_cross_ece_loss_multidim_val_new,_,_,_,_,_,_,_,_,_,_,_ = self.model(X_val, Y_val, collaborator_predictions_val, collaborator_probs_val)
         ece_loss_val = ece_loss_multidim_val_new.item()
         sm_ece_loss_val = sm_ece_loss_multidim_val_new.item()
         out['val_ece_loss_val'] = ece_loss_val
@@ -660,6 +676,8 @@ class Agent():
                         "val/ece_loss_multidim_new": losses['val_ece_loss_multidim_new'],
                         "train/sm_ece_loss_multidim_new": losses['train_sm_ece_loss_multidim_new'],
                         "val/sm_ece_loss_multidim_new": losses['val_sm_ece_loss_multidim_new'],
+                        "train/ece_loss_temperature_scaled": losses['train_ece_loss_temperature_scaled'],
+                        "val/ece_loss_temperature_scaled": losses['val_ece_loss_temperature_scaled'],
                         "train/brier_score": losses['train_brier_score'],
                         "val/brier_score": losses['val_brier_score'],
                         "train/zero_one_loss": losses['train_zero_one_loss'],
@@ -738,7 +756,7 @@ class Agent():
                     # looking at the source of that context manager, it just toggles this variable
                     self.model.require_backward_grad_sync = (micro_step == self.config['gradient_accumulation_steps'] - 1)
                 with self.ctx:
-                    logits, calibrator_logits, CE_loss, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, calibrator_sm_cross_ece_loss, calibrator_cross_ece_loss, calibrator_ece_loss, calibrator_entropy, calibrator_agreement, calibrator_zero_one_loss, brier_score, zero_one_loss, entropy, agreement = self.model(X, Y, collaborator_predictions, collaborator_probs)
+                    logits, calibrator_logits, CE_loss, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, calibrator_sm_cross_ece_loss, calibrator_cross_ece_loss, calibrator_ece_loss, calibrator_entropy, calibrator_agreement, calibrator_zero_one_loss, brier_score, zero_one_loss, entropy, agreement, ece_loss_temperature_scaled = self.model(X, Y, collaborator_predictions, collaborator_probs)
                     loss = loss / self.config['gradient_accumulation_steps'] # scale the loss to account for gradient accumulation
                 # immediately async prefetch next batch while model is doing the forward pass on the GPU
                 X, Y, collaborator_probs = self.get_batch('train')
@@ -838,7 +856,20 @@ def load_model(round, agent_id):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
 
-    model.load_state_dict(state_dict)
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    missing_keys = list(incompatible.missing_keys)
+    unexpected_keys = list(incompatible.unexpected_keys)
+    # Backward compatibility: older checkpoints may not have calibrator weights.
+    allowed_missing_prefixes = ("calibrate_mlp.",)
+    disallowed_missing = [k for k in missing_keys if not k.startswith(allowed_missing_prefixes)]
+    if disallowed_missing or unexpected_keys:
+        raise RuntimeError(
+            f"Error(s) in loading state_dict for GPT:\n"
+            f"  Missing key(s): {disallowed_missing}\n"
+            f"  Unexpected key(s): {unexpected_keys}"
+        )
+    if missing_keys:
+        print(colored(f"ignoring missing checkpoint keys: {missing_keys}", "light_yellow"))
     model.to(config['device'])
     model.eval()
     print(colored(f"loaded checkpoint from {ckpt_path}", 'light_green'))

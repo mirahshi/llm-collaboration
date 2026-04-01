@@ -24,8 +24,8 @@ cross_calibrate = False # cross-calibrate: smECE conditioned on collaborator's p
 cross_multiplier = 1 # multiplier for cross calibration loss
 confidence = False # use confidence calibration; otherwise use probability calibration
 cross_probabilities = True # use collaborator's probabilities for cross calibration
-K = 5 # number of buckets for self ECE
-K_cross = 5 # number of buckets for cross ECE
+K = 10 # number of buckets for self ECE
+K_cross = 10 # number of buckets for cross ECE
 compute_smooth_calibration = False # compute smooth calibration losses (memory intensive)
 
 post_hoc_calibrate = False # post-hoc cross calibrate the model using the predictions of the previous round
@@ -35,12 +35,13 @@ answer_tokens = ['d', 'r', 'u', 'l'] # possible answer tokens
 append_predictions = False # append predictions to output file (default is sampled predictions unless append_argmax_predictions is True)
 append_argmax_predictions = True # if append_predictions is True, append the argmax prediction instead of the sampled prediction
 append_probabilities = False # append probabilities to output file
+append_probabilities_precision = 4 # decimal places for appended probabilities
 append_probabilities_temperature = 1.0 # temperature for appended probabilities (default is 1)
 
 m_lookahead = 1 # number of autoregressive lookahead predictions to generate in one forward pass
 autoregressive_lookahead = True # use autoregressive lookahead (otherwise, use ground truth targets)
 
-prune_dataset = True # prune the dataset after each round to remove examples that are correct with 100% confidence
+prune_dataset = False # prune the dataset after each round to remove examples that are correct with 100% confidence
 
 # we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False

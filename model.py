@@ -149,6 +149,7 @@ class GPTConfig:
     K: int = 5 # number of buckets for self ECE
     K_cross: int = 5 # number of buckets for cross ECE
     compute_smooth_calibration: bool = False # compute smooth calibration losses (memory intensive)
+    append_probabilities_temperature: float = 1.0 # temperature for appended probabilities (default is 1; here it is used for logging ECE loss on scaled probabilities)
     post_hoc_calibrate: bool = False # post-hoc calibrate the model using the predictions of the previous round
     post_hoc_calibrate_multiplier: float = 1.0 # multiplier for post-hoc cross calibration loss
     m_lookahead: int = 1 # number of autoregressive lookahead predictions to generate
@@ -694,6 +695,10 @@ class GPT(nn.Module):
                 ece_loss_multidim_new = self.ECE_multidim_new(answer_probs, labels, K=self.config.K, K_cross=self.config.K_cross, smooth=False, sigma=0.1, confidence=self.config.confidence)
                 zero_one_loss = self.zero_one_loss(logits, targets)
                 entropy = self.entropy(logits)
+
+                # also compute ECE loss on scaled probabilities (same as ECE loss if temperature is 1)
+                answer_probs_scaled = torch.softmax(torch.log(answer_probs.clamp_min(1e-12)) / self.config.append_probabilities_temperature, dim=-1)
+                ece_loss_temperature_scaled = self.ECE_multidim_new(answer_probs_scaled, labels, K=self.config.K, K_cross=self.config.K_cross, smooth=False, sigma=0.1, confidence=self.config.confidence)
             
             if collaborator_predictions is not None or collaborator_probs is not None:
                 # calculate cross calibration error wrt collaborator predictions
@@ -772,7 +777,7 @@ class GPT(nn.Module):
             calibrator_entropy = None
             calibrator_agreement = None
             calibrator_zero_one_loss = None
-            
+            ece_loss_temperature_scaled = None
             # compute calibrator_logits for inference if post_hoc_calibrate is enabled and collaborator_probs provided
             if self.config.post_hoc_calibrate and collaborator_probs is not None:
                 probs = F.softmax(logits, dim=-1)
@@ -782,7 +787,7 @@ class GPT(nn.Module):
             else:
                 calibrator_logits = None
 
-        return logits, calibrator_logits, CE_loss_sequence, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, calibrator_sm_cross_ece_loss, calibrator_cross_ece_loss, calibrator_ece_loss, calibrator_entropy, calibrator_agreement, calibrator_zero_one_loss, brier_score, zero_one_loss, entropy, agreement
+        return logits, calibrator_logits, CE_loss_sequence, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, calibrator_sm_cross_ece_loss, calibrator_cross_ece_loss, calibrator_ece_loss, calibrator_entropy, calibrator_agreement, calibrator_zero_one_loss, brier_score, zero_one_loss, entropy, agreement, ece_loss_temperature_scaled
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -906,7 +911,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, calibrator_logits, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ = self(idx_cond, collaborator_probs=collaborator_probs)
+            logits, calibrator_logits, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ = self(idx_cond, collaborator_probs=collaborator_probs)
             if use_calibrator_logits:
                 assert calibrator_logits is not None, "calibrator_logits must be provided when use_calibrator_logits is True"
                 logits = calibrator_logits
