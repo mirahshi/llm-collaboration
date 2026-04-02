@@ -18,15 +18,12 @@ def format_maze(maze_str):
     return formatted_maze
 
 class Agent():
-    def __init__(self, config, round, id, tokenizer, model, collaborator_output=None):
+    def __init__(self, config, round, id, tokenizer, model):
         self.config = config
         self.round = round
         self.id = id
-        self.collaborator_output = collaborator_output
         self.tokenizer = tokenizer
         self.model = model
-
-        self.history = []
 
     def generate_response(self, prompt):
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -60,20 +57,13 @@ class Agent():
         probs = F.softmax(outputs.logits[0, -1, :], dim=-1)
         prob_vector = [probs[i].item() for i in [67, 81, 84, 75]] # d, r, u, l
 
-        # Persist dialogue state so future calls include prior turns.
-        self.history.append(prompt)
-        self.history.append([argmax_token, prob_vector])
-
         return argmax_token, prob_vector
 
     def format_inputs(self, prompt: str):
         """
         Text tokenization.
         """
-        if self.history:
-            history_lines = [f"Message {idx + 1}: {msg}" for idx, msg in enumerate(self.history)]
-            prompt = "\n".join(history_lines + [f"Message {len(self.history) + 1}: {prompt}"])
-
+        prompt = "/no_think" + prompt # turn off thinking
         return self.tokenizer(prompt, return_tensors="pt")
 
 def pretrain_converse(config, tokenizer, model, starting_prompts):
@@ -89,16 +79,14 @@ def pretrain_converse(config, tokenizer, model, starting_prompts):
         agent_id = r % config['num_agents'] # determine which agent trains this round
         agent = agents[agent_id]
         agent.round = r
-        if r == agent_id: # add starting prompt for first round of agent's turn
-            prompt = starting_prompts[agent_id] + prompt
+        prompt = starting_prompts[agent_id] + prompt
         print(f"PROMPT: {prompt}")
         argmax_token, prob_vector = agent.generate_response(prompt)
-        print(f"Round {r}: agent {agent_id} generated response: {argmax_token} with probabilities for [d,r,u,l]: {prob_vector}")
+        rounded_prob_vector = [round(p, 2) for p in prob_vector]
+        print(f"Round {r}: agent {agent_id} generated response: {argmax_token} with probabilities for [d,r,u,l]: {rounded_prob_vector}")
 
         # update prompt for next round
-        prompt = f"Agent {agent_id} says: {argmax_token}. Respond with one of [d,r,u,l]."
-
-    
+        prompt = f"The other agent said: {argmax_token} with probabilities for [d,r,u,l]: {rounded_prob_vector}. Respond with one of [d,r,u,l]."
 
 
 if __name__ == "__main__":
