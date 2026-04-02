@@ -73,7 +73,6 @@ class Agent():
         if self.history:
             history_lines = [f"Message {idx + 1}: {msg}" for idx, msg in enumerate(self.history)]
             prompt = "\n".join(history_lines + [f"Message {len(self.history) + 1}: {prompt}"])
-        print(f"PROMPT: {prompt}")
 
         return self.tokenizer(prompt, return_tensors="pt")
 
@@ -98,7 +97,6 @@ def pretrain_converse(config, tokenizer, model, starting_prompts):
 
         # update prompt for next round
         prompt = f"Agent {agent_id} says: {argmax_token}. Respond with one of [d,r,u,l]."
-    print(f"Agent 0 history: {agents[0].history}")
 
     
 
