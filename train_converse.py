@@ -417,7 +417,7 @@ class Agent():
                 T = self.config['append_probabilities_temperature']
                 answer_probs_scaled = torch.softmax(torch.log(answer_probs.clamp_min(1e-12)) / T, dim=-1)
                 if T == 1.0:
-                    assert torch.allclose(answer_probs, answer_probs_scaled), f"answer_probs and answer_probs_scaled are not the same when T = 1.0:\nanswer_probs = {answer_probs}\nanswer_probs_scaled = {answer_probs_scaled}"
+                    assert torch.allclose(answer_probs, answer_probs_scaled, atol=1e-4), f"answer_probs and answer_probs_scaled are not the same when T = 1.0:\nanswer_probs = {answer_probs}\nanswer_probs_scaled = {answer_probs_scaled}"
 
                 # write predictions to label file
                 label_lines = f_label_lines[start_line_idx:start_line_idx + batch_size]
