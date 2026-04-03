@@ -30,19 +30,20 @@ class Agent():
         response = self.client.chat.completions.create(
             model=self.config['model_name'],
             messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=256,
+            max_completion_tokens=1,
             temperature=self.config['temperature'],
             top_p=self.config['top_p'],
             logprobs=True,
             top_logprobs=5,
         )
+        print(len(response.choices))
         choice = response.choices[0]
         if choice.logprobs and choice.logprobs.content:
             token_info = choice.logprobs.content[0]
             print(f"Token: '{token_info.token}'")
             for entry in token_info.top_logprobs:
                 print(f"  '{entry.token}': {np.exp(entry.logprob):.4f}")
-
+        
         choice = response.choices[0]
         argmax_token = choice.message.content.strip()
 
@@ -83,6 +84,7 @@ def api_converse(config, client, starting_prompts):
         # update prompt for next round
         prompt = f"The other agent said: {argmax_token} with probabilities for [d,r,u,l]: {rounded_prob_vector}. Respond with one of [d,r,u,l]."
 
+    return argmax_token
 
 if __name__ == "__main__":
     # load API key
@@ -90,19 +92,16 @@ if __name__ == "__main__":
     client = OpenAI(api_key=api_key)
 
     config = {
-        "model_name": "gpt-4o",  
+        "model_name": "gpt-4o",  # model to use for the conversation
         "max_new_tokens": 5,
         "temperature": 0.7,
-        "top_p": 0.9,
+        "top_p": 0.01,
         "num_rounds": 4,
         "num_agents": 2,
     }
 
     maze_str0 = "@#??#??#??.??.??.?.?.##?#..##?.#.??*"
     maze_str1 = "@?#.?..?#.?..?.#?.?#???.?????#???..*"
-    prefix = "ddrr"
-    prefix = "d"
-    prefix = "dd"
 
     def generate_starting_prompt(maze_str, prefix):
         formatted_maze = format_maze(maze_str)
@@ -122,5 +121,19 @@ if __name__ == "__main__":
             Then, respond with one of [d, r, u, l]. Do not include any other text.
             """
 
-    starting_prompts = [generate_starting_prompt(maze_str0, prefix), generate_starting_prompt(maze_str1, prefix)]
-    api_converse(config, client, starting_prompts)
+    prefix = ""
+    label_sequence = "ddrrdddrrr"
+
+    for i in range(len(label_sequence)):
+        starting_prompts = [generate_starting_prompt(maze_str0, prefix), generate_starting_prompt(maze_str1, prefix)]    
+        argmax_token = api_converse(config, client, starting_prompts)
+        prefix += argmax_token
+        print(f"Updated prefix after round {i}: {prefix}")
+
+    # Final evaluation of the generated path against the label sequence
+    print(f"Final generated path: {prefix}")
+    print(f"Label sequence: {label_sequence}")
+    if prefix == label_sequence:
+        print("Success! The generated path matches the label sequence.")
+    else:
+        print("The generated path does not match the label sequence.")
