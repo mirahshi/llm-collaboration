@@ -63,8 +63,22 @@ class Agent():
         """
         Text tokenization.
         """
-        prompt = "/no_think" + prompt # turn off thinking
-        return self.tokenizer(prompt, return_tensors="pt")
+        user_prompt = "/no_think" + prompt  # turn off thinking
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            messages = [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": user_prompt},
+            ]
+            chat_prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            return self.tokenizer(chat_prompt, return_tensors="pt")
+
+        # Fallback for non-chat tokenizers.
+        plain_prompt = f"User: {user_prompt}\nAssistant:"
+        return self.tokenizer(plain_prompt, return_tensors="pt")
 
 def pretrain_converse(config, tokenizer, model, starting_prompts):
     # initialize agents
@@ -86,12 +100,12 @@ def pretrain_converse(config, tokenizer, model, starting_prompts):
         print(f"Round {r}: agent {agent_id} generated response: {argmax_token} with probabilities for [d,r,u,l]: {rounded_prob_vector}")
 
         # update prompt for next round
-        prompt = f"The other agent said: {argmax_token} with probabilities for [d,r,u,l]: {rounded_prob_vector}. Respond with one of [d,r,u,l]."
+        prompt = f"The other agent said: {argmax_token} with probabilities for [d,r,u,l]: {rounded_prob_vector}. Respond with one of [d,r,u,l]. Do not include any other text."
 
 
 if __name__ == "__main__":
     config = {
-    "model_name": "Qwen/Qwen3.5-2B", # hugging face model to load
+    "model_name": "Qwen/Qwen2.5-7B-Instruct", # hugging face model to load
     "model_path": "/home/mirahshi/projects/llm-collaboration/pretrained_models", # path to cache the model
     "max_new_tokens": 5, # maximum number of new tokens to generate
     "temperature": 0.7, # temperature for sampling

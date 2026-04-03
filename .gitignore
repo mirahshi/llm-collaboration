@@ -206,9 +206,8 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+*.sh
 gpt_api_key.txt
-data/
 out-*/
 wandb/
-run_grid*
 scratch.py
