@@ -140,7 +140,7 @@ if __name__ == "__main__":
     "temperature": 0.7, # temperature for sampling
     "top_p": 0.9, # top-p sampling
     "repetition_penalty": 1.1, # repetition penalty
-    "num_rounds": 2, # number of rounds to train
+    "num_rounds": 1, # number of rounds to train
     "num_agents": 2, # number of agents
     }
     
@@ -173,18 +173,18 @@ if __name__ == "__main__":
     
     maze_str0 = "@##.#..##......#...#.##.#..###.#...*"
     maze_str1 = "@?#.?..?#.?..?.#?.?#???.?????#???..*"
-    prefix = "ddrr"
 
     def generate_starting_prompt(maze_str, prefix):
         formatted_maze = format_maze(maze_str)
-        return_string =  f"""Task: You are going to play the collaborative maze game together with another agent. The maze consists of a grid with walls and a goal. Your task is to determine the next move on the path. You will each get your own map of the same maze, with some coordinates hidden. Because of the hidden coordinates, you will need to communicate with the other agent to share information about the maze and coordinate your next move.
+        return_string =  f"""Task: You are going to play the collaborative maze game together with another agent. The maze consists of a grid with walls and a goal. Your task is to jointly determine the next move on the path. You and the other agent will take that action together. You will each get your own map of the same maze, with some coordinates hidden. Because of the hidden coordinates, you will need to communicate with the other agent to share information about the maze and coordinate your next move. Both agents together have enough information to solve the maze, so you do not need to explore.
 Rules:
 - You can only move to adjacent cells [down(d), right(r), up(u), left(l)].
 - You can not move diagonally or through walls.
+- Once you make an incorrect move, you lose. 
 Here is **your** map of the maze with a legend of the symbols: \n
 {formatted_maze} \n
 Legend:
-@ - Current Position
+@ - Starting Position at (0, 0) (before we have moved)
 * - Goal Position
 . - Path
 # - Wall
@@ -192,7 +192,7 @@ Legend:
 """
         if prefix != "":
             return_string += f"""
-This is the path to the goal that we have moved so far from which you can infer your current position: {prefix}
+This is the path to the goal starting from @ that we have moved so far from which you can infer your current position: {prefix}
 """
         return_string += """
 Explain your reasoning, then answer with one of d, r, u, l. Put your final answer after the delimiter ~. For example, if your final answer is d, your response should contain ~d. 
@@ -205,12 +205,13 @@ Explain your reasoning, then answer with one of d, r, u, l. Put your final answe
     prefix = ""
     label_sequence = "ddrrdddrrr"
 
-    # for i in range(len(label_sequence)):
-    for i in range(1):
+    for i in range(len(label_sequence)):
+    # for i in range(2):
+        print(colored(f"MOVE {i+1}: ======================================================", 'light_green'))
         starting_prompts = [generate_starting_prompt(maze_str0, prefix), generate_starting_prompt(maze_str1, prefix)]    
         response = pretrain_converse(config, tokenizer, model, starting_prompts)
         prefix += response[-1]
-        print(f"Updated prefix after move {i}: {prefix}")
+        print(f"Updated prefix after move {i+1}: {prefix}")
 
     # Final evaluation of the generated path against the label sequence
     print(f"Final generated path: {prefix}")
