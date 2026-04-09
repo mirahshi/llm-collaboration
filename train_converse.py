@@ -466,37 +466,51 @@ class Agent():
 
                 # write predictions to label file
                 label_lines = f_label_lines[start_line_idx:start_line_idx + batch_size]
+                output_lines = []
+                pruned_train_lines = []
+                pruned_val_lines = []
+                split_idx = int(num_examples * 0.9)
+                
                 for i, (label_line, prediction, prob, prob_scaled) in enumerate(zip(label_lines, predictions, answer_probs, answer_probs_scaled)):
                     remove_example = False
                     if self.config['prune_dataset']:
-                    # if answer_probs has prob 1 on the correct answer, skip it
+                        # if answer_probs has prob 1 on the correct answer, skip it
                         correct_answer = label_line.rstrip('\n')[-1]
                         correct_idx = self.config['answer_tokens'].index(correct_answer)
                         prob_correct_answer = prob[0, correct_idx].item()
                         if prob_correct_answer > 0.999:
                             if torch.rand(1).item() > 0.1: # keep easy examples with probability 0.1
                                 remove_example = True
-                    with open(output_path, "a", encoding="utf-8") as out:
-                        output_line = label_line.rstrip('\n')
-                        # write probabilities, prediction, and label to output file
-                        if self.config['append_predictions']:
-                            output_line = f"{prediction},{output_line}"
-                        if self.config['append_probabilities']:
-                            # prob is a list. convert prob to a string without brackets and join elemets with commas
-                            # round probabilities to specified number of decimal places
-                            prob_string = ','.join(f"{p:.{self.config['append_probabilities_precision']}f}" for p in prob_scaled[0].tolist())
-                            output_line = f"{prob_string},{output_line}"
-                        out.write(f"{output_line};{prob[0].tolist()};{prob_scaled[0].tolist()}\n")   
-                        # out.write(f"{prob[0].tolist()};{prediction};{label_line}\n")
-                        if self.config['prune_dataset'] and not remove_example:
-                            split_idx = int(num_examples*0.9)
-                            example_idx = start_line_idx + i
-                            if example_idx < split_idx: # write to pruned train set
-                                output_path_pruned = output_path_pruned_train
-                            else: # write to pruned val set
-                                output_path_pruned = output_path_pruned_val
-                            with open(output_path_pruned, "a", encoding="utf-8") as out_pruned:
-                                out_pruned.write(f"{output_line};{prob[0].tolist()};{prob_scaled[0].tolist()}\n")
+                    
+                    output_line = label_line.rstrip('\n')
+                    # write probabilities, prediction, and label to output file
+                    if self.config['append_predictions']:
+                        output_line = f"{prediction},{output_line}"
+                    if self.config['append_probabilities']:
+                        # round probabilities to specified number of decimal places
+                        prob_string = ','.join(f"{p:.{self.config['append_probabilities_precision']}f}" for p in prob_scaled[0].tolist())
+                        output_line = f"{prob_string},{output_line}"
+                    
+                    full_line = f"{output_line};{prob[0].tolist()};{prob_scaled[0].tolist()}\n"
+                    output_lines.append(full_line)
+                    
+                    if self.config['prune_dataset'] and not remove_example:
+                        example_idx = start_line_idx + i
+                        if example_idx < split_idx:  # write to pruned train set
+                            pruned_train_lines.append(full_line)
+                        else:  # write to pruned val set
+                            pruned_val_lines.append(full_line)
+                
+                # Batch write to files
+                with open(output_path, "a", encoding="utf-8") as out:
+                    out.writelines(output_lines)
+                if self.config['prune_dataset']:
+                    if pruned_train_lines:
+                        with open(output_path_pruned_train, "a", encoding="utf-8") as out:
+                            out.writelines(pruned_train_lines)
+                    if pruned_val_lines:
+                        with open(output_path_pruned_val, "a", encoding="utf-8") as out:
+                            out.writelines(pruned_val_lines)
             if self.config['prune_dataset']:
                 num_examples = len(f_label_lines)
                 # print number of examples in output file after pruning
