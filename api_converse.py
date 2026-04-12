@@ -8,6 +8,7 @@ Reads the API key from gpt_api_key.txt, then runs multi-agent rounds.
 
 from __future__ import annotations
 from termcolor import colored
+import argparse
 import os
 import sys
 from tqdm import tqdm
@@ -16,6 +17,7 @@ import re
 import numpy as np
 from pathlib import Path
 from openai import OpenAI
+import math
 
 
 class _Tee:
@@ -26,7 +28,7 @@ class _Tee:
     def __init__(self, log_path: str, verbose: bool = True):
         self._stdout = sys.stdout
         self._verbose = verbose
-        self._log = open(log_path, "a", buffering=1, encoding="utf-8")
+        self._log = open(log_path, "w", buffering=1, encoding="utf-8")
 
     def write(self, data: str):
         if self._verbose:
@@ -69,7 +71,10 @@ class Agent():
         self.client = client
 
     def generate_response(self, prompt, delimiter='~'):
-        import math
+        """
+        Returns: full response, final answer, probability vector, format failure
+        format failure is True if the final answer is not in the target tokens or if the probabilities are not valid.
+        """
         response = self.client.chat.completions.create(
             model=self.config['model_name'],
             messages=[{"role": "user", "content": prompt}],
@@ -86,6 +91,8 @@ class Agent():
         final_answer = None
         format_failure = False
 
+        target_tokens = ['d', 'r', 'u', 'l']
+        
         if choice.logprobs and choice.logprobs.content:
             token_contents = choice.logprobs.content
             delimiter_idx = None
@@ -97,25 +104,25 @@ class Agent():
             if delimiter_idx is not None and delimiter_idx + 1 < len(token_contents):
                 final_answer_token_info = token_contents[delimiter_idx + 1]
                 final_answer = final_answer_token_info.token.strip()
+                if final_answer not in target_tokens:
+                    format_failure = True
                 
-                if config['append_probabilities']:
-                    if not config['verbalize_probabilities']:
-                        prob_vector = [0.0, 0.0, 0.0, 0.0]  # d, r, u, l
-                        target_tokens = ['d', 'r', 'u', 'l']
-                        for entry in final_answer_token_info.top_logprobs:
-                            token = entry.token.strip().lower()
-                            if token in target_tokens:
-                                idx = target_tokens.index(token)
-                                prob_vector[idx] += math.exp(entry.logprob)
-                    else:
-                        prob_match = re.search(r'%\s*\[([^\]]+)\]', full_response)
-                        if prob_match:
-                            prob_str = prob_match.group(1)
-                            prob_vector = [float(p.strip()) for p in prob_str.split(',')]
-                        if prob_vector is None or len(prob_vector) != 4:
-                            print(colored(f"Warning: Probabilities for [d,r,u,l] should be 4 numbers, got {prob_vector}", 'light_red'))
-                            prob_vector = None
-                            format_failure = True
+                if self.config['verbalize_probabilities']: # get probabilities from response
+                    prob_match = re.search(r'%\s*\[([^\]]+)\]', full_response)
+                    if prob_match:
+                        prob_str = prob_match.group(1)
+                        prob_vector = [float(p.strip()) for p in prob_str.split(',')]
+                    if prob_vector is None or len(prob_vector) != 4:
+                        print(colored(f"Warning: Probabilities for [d,r,u,l] should be 4 numbers, got {prob_vector}", 'light_red'))
+                        prob_vector = None
+                        format_failure = True
+                elif self.config['append_probabilities']: # get probabilities from logprobs
+                    prob_vector = [0.0, 0.0, 0.0, 0.0]  # d, r, u, l
+                    for entry in final_answer_token_info.top_logprobs:
+                        token = entry.token.strip().lower()
+                        if token in target_tokens:
+                            idx = target_tokens.index(token)
+                            prob_vector[idx] += math.exp(entry.logprob)
             else:
                 print(colored(f"Warning: Delimiter '{delimiter}' not found or no token after delimiter", 'light_red'))
                 format_failure = True
@@ -129,6 +136,15 @@ def api_converse(config, client, starting_prompts):
         agent_id: Agent(config, 0, agent_id, client)
         for agent_id in range(config['num_agents'])
     }
+
+    # save per-round responses
+    conversation_log = {
+        'full_responses': [],
+        'final_answers': [],
+        'prob_vectors': [],
+        'format_failures': [],
+    }
+
     # conversation loop
     prompt = ""
     for r in range(config['num_rounds']):
@@ -139,6 +155,12 @@ def api_converse(config, client, starting_prompts):
         prompt = starting_prompts[agent_id] + prompt
         print(colored(f"PROMPT: {prompt}", 'light_blue'))
         full_response, final_answer, prob_vector, format_failure = agent.generate_response(prompt)
+
+        # save responses for this round
+        conversation_log['full_responses'].append(full_response)
+        conversation_log['final_answers'].append(final_answer)
+        conversation_log['prob_vectors'].append(prob_vector)
+        conversation_log['format_failures'].append(format_failure)
         
         if prob_vector is not None:
             rounded_prob_vector = [round(p, 4) for p in prob_vector]
@@ -149,21 +171,30 @@ def api_converse(config, client, starting_prompts):
         if config['append_probabilities']:
             print(f"Probabilities for [d,r,u,l]: {rounded_prob_vector}")
         
+        # stop the conversation if there is a format failure
         if format_failure:
-            return full_response, final_answer, True
+            break
 
         # update prompt for next round
-        if config['append_probabilities']:
-            prompt = f"The other agent said: {full_response} with probabilities for [d,r,u,l]: {rounded_prob_vector}."
+        if config['append_full_response']:
+            prompt = f"The other agent said: {full_response}"
         else:
-            prompt = f"The other agent said: {full_response}."
+            if config['append_probabilities']: # append probabilities only
+                prompt = f"The other agent answered with probabilities for [d,r,u,l]: {rounded_prob_vector}."
+            else: # append action only
+                prompt = f"The other agent answered with: {final_answer}."
 
-    return full_response, final_answer, False
+        # if config['append_probabilities']:
+        #     prompt = f"The other agent said: {full_response} with probabilities for [d,r,u,l]: {rounded_prob_vector}."
+        # else:
+        #     prompt = f"The other agent said: {full_response}."
+
+    return conversation_log
 
 def generate_starting_prompt(config, maze_str, prefix, solo):
     formatted_maze = format_maze(maze_str)
     if not solo: # generate collaborative starting prompt
-        return_string = f"""Task: You are going to play the collaborative maze game together with another agent. The maze consists of a grid with walls and a goal. Your task is to jointly determine the next move on the path. You and the other agent will take that action together. You will each get your own map of the same maze, with some coordinates hidden. Because of the hidden coordinates, you will need to communicate with the other agent to share information about the maze and coordinate your next move. The two agents' maps have complementary information. Both agents together have enough information to solve the maze, so you do not need to explore.
+        return_string = f"""Task: You are going to play the collaborative maze game together with another agent. The maze consists of a grid with walls and a goal. Your task is to jointly determine the next move on the path. You and the other agent will take that action together. You will each get your own map of the same maze, with some coordinates hidden. Because of the hidden coordinates, you will need to communicate with the other agent to share information about the maze and coordinate your next move. Both agents together have enough information to solve the maze, so you do not need to explore.
 Rules:
 - You can only move to adjacent cells [down(d), right(r), up(u), left(l)].
 - You can not move diagonally or through walls.
@@ -199,7 +230,7 @@ This is the path to the goal starting from @ that you have moved so far from whi
     return_string += """
 Explain your reasoning, then you must answer with one of d, r, u, l. Put your final answer after the delimiter ~. For example, if your final answer is d, your response should contain ~d. 
 """
-    if config['append_probabilities'] and config['verbalize_probabilities']: # add instructions to verbalize probabilities
+    if config['verbalize_probabilities']: # add instructions to verbalize probabilities
         return_string += """
 Finally, give the probabilities you think each move d, r, u, l is correct after the delimiter %. For example, if you think the probability of d, r, u, l is 0.8, 0.1, 0.05, 0.05, your response should contain %[0.8, 0.1, 0.05, 0.05]. Make sure it is a valid probability vector, i.e. the sum of the probabilities is 1.
 """    
@@ -210,25 +241,73 @@ Your moves are timed for speed so hurry up!
 
 
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected (true/false, yes/no, 1/0)')
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Collaborative maze conversation using ChatGPT API")
+    parser.add_argument("--model_name", type=str, default="gpt-4.1-mini",
+                        help="Model to use for the conversation")
+    parser.add_argument("--max_new_tokens", type=int, default=2048,
+                        help="Max tokens for response (allow for reasoning before final answer)")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="Sampling temperature")
+    parser.add_argument("--top_p", type=float, default=0.9,
+                        help="Top-p sampling parameter")
+    parser.add_argument("--num_rounds", type=int, default=4,
+                        help="Number of conversation rounds between agents")
+    parser.add_argument("--num_agents", type=int, default=2,
+                        help="Number of agents")
+    parser.add_argument("--solo", type=str2bool, default=False,
+                        help="Run solo full info baseline instead of collaborative game")
+    parser.add_argument("--append_probabilities", type=str2bool, default=False,
+                        help="Communicate probabilities instead of actions")
+    parser.add_argument("--verbalize_probabilities", type=str2bool, default=True,
+                        help="Verbalize probabilities in prompt (if False, taken from logprobs)")
+    parser.add_argument("--append_full_response", type=str2bool, default=False,
+                        help="Communicate full response instead of just action/probabilities")
+    parser.add_argument("--data_dir", type=str, default="out-api_exp1",
+                        help="Directory containing input data")
+    parser.add_argument("--out_dir", type=str, default="out-api_exp1/test",
+                        help="Directory for output logs")
+    parser.add_argument("--verbose", type=str2bool, default=True,
+                        help="Print to terminal")
+    parser.add_argument("--num_mazes", type=int, default=50,
+                        help="Number of mazes to run")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+    
     # load API key
     api_key = Path("gpt_api_key.txt").read_text().strip()
     client = OpenAI(api_key=api_key)
 
     config = {
-        "model_name": "gpt-4.1-mini",  # model to use for the conversation
-        "max_new_tokens": 1024,  # allow for reasoning before final answer
-        "temperature": 0.7,
-        "top_p": 0.9,
-        "num_rounds": 4,  # number of conversation rounds between agents
-        "num_agents": 2,
-        "solo": False, # if True, runs solo full info baseline; if False, runs collaborative game
-        "append_probabilities": False, # if True, append probabilities to the output
-        "verbalize_probabilities": True, # if False, probabilities taken from logprobs
-        "data_dir": "out-api_exp1",
-        "out_dir": "out-api_exp1/collab-no-probs",
-        "verbose": False # print to terminal
+        "model_name": args.model_name,
+        "max_new_tokens": args.max_new_tokens,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "num_rounds": args.num_rounds,
+        "num_agents": args.num_agents,
+        "solo": args.solo,
+        "append_probabilities": args.append_probabilities,
+        "verbalize_probabilities": args.verbalize_probabilities,
+        "append_full_response": args.append_full_response,
+        "data_dir": args.data_dir,
+        "out_dir": args.out_dir,
+        "verbose": args.verbose,
     }
+    num_mazes = args.num_mazes
 
     # redirect all print output to out_dir/print_log.txt as well as stdout
     os.makedirs(config["out_dir"], exist_ok=True)
@@ -239,7 +318,8 @@ if __name__ == "__main__":
     data_dir = config["data_dir"]
     success_count = 0
     format_failure_count = 0
-    num_mazes = 50
+
+    maze_conversation_logs = {i: [] for i in range(num_mazes)} # save conversation logs for each maze
     if config["solo"]:
         _tee.force_print(colored("Running solo full info baseline", 'light_yellow'))
         config["num_agents"] = 1
@@ -254,30 +334,41 @@ if __name__ == "__main__":
 
             prefix = ""
             # autoregessively generate the path
-            for i in range(len(label_sequence)):
+            wrong_move = False
+            for j in range(len(label_sequence)):
             # for i in range(3):
-                print(colored(f"MOVE {i+1}: ======================================================", 'light_green'))
+                print(colored(f"MOVE {j+1}: ======================================================", 'light_green'))
                 starting_prompt = generate_starting_prompt(config, maze_str, prefix, solo=True)
-                full_response, final_answer, format_failure = api_converse(config, client, [starting_prompt])
+                conversation_log = api_converse(config, client, [starting_prompt])
+                
+                # save conversation log for this maze
+                maze_conversation_logs[i].append(conversation_log)
+                
+                # move onto next maze if there is a format failure
+                format_failure = conversation_log['format_failures'][-1]
                 if format_failure:
+                    print("Response failed")
                     format_failure_count += 1
                     break
-                if final_answer:
-                    prefix += final_answer[0].lower()
-                else:
-                    prefix += full_response[-1]
                 
-                print(f"Updated prefix after move {i+1}: {prefix}")
-            if format_failure:
+                final_answer = conversation_log['final_answers'][-1]
+                prefix += final_answer[0].lower()
+
+                # move onto next maze if the final answer is wrong
+                if final_answer[0].lower() != label_sequence[j]:
+                    print(f"Wrong move! The generated path {prefix} does not match the label sequence {label_sequence}.")
+                    wrong_move = True
+                    break
+                print(f"Updated prefix after move {j+1}: {prefix}")
+            
+            if conversation_log['format_failures'][-1] or wrong_move:
                 continue
-            # Final evaluation of the generated path against the label sequence
+            
             print(f"Final generated path: {prefix}")
             print(f"Label sequence: {label_sequence}")
-            if prefix == label_sequence:
-                success_count += 1
-                print("Success! The generated path matches the label sequence.")
-            else:
-                print("The generated path does not match the label sequence.")
+            success_count += 1
+            print("Success! The generated path matches the label sequence.")
+
         _tee.force_print(f"Success rate: {success_count} / {num_mazes}")
         _tee.force_print(f"Format failure rate: {format_failure_count} / {num_mazes}")
     else:
@@ -300,62 +391,45 @@ if __name__ == "__main__":
             prefix = ""
             # autoregessively generate the path
             wrong_move = False
-            for i in range(len(label_sequence)):
+            for j in range(len(label_sequence)):
             # for i in range(3):
-                print(colored(f"MOVE {i+1}: ======================================================", 'light_green'))
+                print(colored(f"MOVE {j+1}: ======================================================", 'light_green'))
                 starting_prompts = [generate_starting_prompt(config, maze_str0, prefix, solo=False), generate_starting_prompt(config, maze_str1, prefix, solo=False)]    
-                full_response, final_answer, format_failure = api_converse(config, client, starting_prompts)
-                prefix += final_answer[0].lower()
-                if format_failure or final_answer is None:
+                conversation_log = api_converse(config, client, starting_prompts)
+                
+                # save conversation log for this maze
+                maze_conversation_logs[i].append(conversation_log)
+                
+                # move onto next maze if there is a format failure
+                format_failure = conversation_log['format_failures'][-1]
+                if format_failure:
                     print("Response failed")
                     format_failure_count += 1
                     break
-                if final_answer[0].lower() != label_sequence[i]: # wrong move
+                
+                final_answer = conversation_log['final_answers'][-1]
+                prefix += final_answer[0].lower()
+
+                # move onto next maze if the final answer is wrong
+                if final_answer[0].lower() != label_sequence[j]:
                     print(f"Wrong move! The generated path {prefix} does not match the label sequence {label_sequence}.")
                     wrong_move = True
                     break
-                print(f"Updated prefix after move {i+1}: {prefix}")
+                print(f"Updated prefix after move {j+1}: {prefix}")
             
             if format_failure or wrong_move:
                 continue
+            
             print(f"Final generated path: {prefix}")
             print(f"Label sequence: {label_sequence}")
             success_count += 1
             print("Success! The generated path matches the label sequence.")
-            # Final evaluation of the generated path against the label sequence
-            # if prefix == label_sequence:
-            #     success_count += 1
-            #     print("Success! The generated path matches the label sequence.")
-            # else:
-            #     print("The generated path does not match the label sequence.")
+
         _tee.force_print(f"Success rate: {success_count} / {num_mazes}")
         _tee.force_print(f"Format failure rate: {format_failure_count} / {num_mazes}")
+    
+    # save conversation logs
+    np.save(os.path.join(config["out_dir"], "maze_conversation_logs.npy"), maze_conversation_logs)
+    _tee.force_print(f"Saved conversation logs to {os.path.join(config['out_dir'], 'maze_conversation_logs.npy')}")
 
     _tee.close()
-
-    # maze_str0 = "@#??#??#??.??.??.?.?.##?#..##?.#.??*"
-    # # maze_str0 = "@##.#..##......#...#.##.#..###.#...*"
-    # maze_str1 = "@?#.?..?#.?..?.#?.?#???.?????#???..*"
-
-    # prefix = ""
-    # label_sequence = "ddrrdddrrr"
-
-    # # autoregessively generate the path
-    # for i in range(len(label_sequence)):
-    # # for i in range(3):
-    #     print(colored(f"MOVE {i+1}: ======================================================", 'light_green'))
-    #     starting_prompts = [generate_starting_prompt(config, maze_str0, prefix), generate_starting_prompt(config, maze_str1, prefix)]    
-    #     full_response, final_answer = api_converse(config, client, starting_prompts)
-    #     if final_answer:
-    #         prefix += final_answer[0].lower()
-    #     else:
-    #         prefix += full_response[-1]
-    #     print(f"Updated prefix after move {i+1}: {prefix}")
-
-    # # Final evaluation of the generated path against the label sequence
-    # print(f"Final generated path: {prefix}")
-    # print(f"Label sequence: {label_sequence}")
-    # if prefix == label_sequence:
-    #     print("Success! The generated path matches the label sequence.")
-    # else:
-    #     print("The generated path does not match the label sequence.")
