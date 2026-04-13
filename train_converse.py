@@ -88,6 +88,7 @@ append_probabilities_precision = 2 # decimal places for appended probabilities
 append_probabilities_temperature = 1.0 # temperature for appended probabilities (default is 1)
 prune_dataset = False # prune the dataset after each round to remove examples that are correct with 100% confidence
 use_curriculum = False # if True, train on pruned train set (requires prune_dataset=True)
+generate_hard_dataset = False # generate hard dataset
 # model
 n_layer = 12
 n_head = 12
@@ -470,6 +471,14 @@ class Agent():
                 pruned_train_lines = []
                 pruned_val_lines = []
                 split_idx = int(num_examples * 0.9)
+                if self.config['generate_hard_dataset']:
+                    hard_dataset_lines0 = []
+                    hard_dataset_lines1 = []
+                    with open(os.path.join(self.config['out_dir'], 'input0_round0.txt'), 'r') as f:
+                        lines0 = f.readlines()
+                    with open(os.path.join(self.config['out_dir'], 'input1_round0.txt'), 'r') as f:
+                        lines1 = f.readlines()
+
                 
                 for i, (label_line, prediction, prob, prob_scaled) in enumerate(zip(label_lines, predictions, answer_probs, answer_probs_scaled)):
                     remove_example = False
@@ -500,6 +509,10 @@ class Agent():
                             pruned_train_lines.append(full_line)
                         else:  # write to pruned val set
                             pruned_val_lines.append(full_line)
+                        if self.config['generate_hard_dataset']:
+                            # generate hard dataset
+                            hard_dataset_lines0.append(lines0[example_idx])
+                            hard_dataset_lines1.append(lines1[example_idx])
                 
                 # Batch write to files
                 with open(output_path, "a", encoding="utf-8") as out:
@@ -511,6 +524,12 @@ class Agent():
                     if pruned_val_lines:
                         with open(output_path_pruned_val, "a", encoding="utf-8") as out:
                             out.writelines(pruned_val_lines)
+                if self.config['generate_hard_dataset']:
+                    with open(os.path.join(self.config['out_dir'], 'hard_input0_round0.txt'), 'a', encoding="utf-8") as out:
+                        out.writelines(hard_dataset_lines0)
+                    with open(os.path.join(self.config['out_dir'], 'hard_input1_round0.txt'), 'a', encoding="utf-8") as out:
+                        out.writelines(hard_dataset_lines1)
+            
             if self.config['prune_dataset']:
                 num_examples = len(f_label_lines)
                 # print number of examples in output file after pruning
