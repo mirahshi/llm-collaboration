@@ -347,6 +347,9 @@ if __name__ == "__main__":
                 print(colored(f"MOVE {j+1}: ======================================================", 'light_green'))
                 starting_prompt = generate_starting_prompt(config, maze_str, prefix, solo=True)
                 conversation_log = api_converse(config, client, [starting_prompt])
+
+                # save label to conversation log
+                conversation_log['label'] = label_sequence[j]
                 
                 # save conversation log for this maze
                 maze_conversation_logs[i].append(conversation_log)
@@ -369,7 +372,7 @@ if __name__ == "__main__":
                 print(f"Updated prefix after move {j+1}: {prefix}")
             
             # save conversation log for this maze
-            np.save(os.path.join(conversations_dir, f"maze_{i}.npy"), maze_conversation_logs[i])
+            np.save(os.path.join(conversations_dir, f"maze_{i}.npy"), {i: maze_conversation_logs[i]})
 
             if conversation_log['format_failures'][-1] or wrong_move:
                 continue
@@ -406,6 +409,9 @@ if __name__ == "__main__":
                 print(colored(f"MOVE {j+1}: ======================================================", 'light_green'))
                 starting_prompts = [generate_starting_prompt(config, maze_str0, prefix, solo=False), generate_starting_prompt(config, maze_str1, prefix, solo=False)]    
                 conversation_log = api_converse(config, client, starting_prompts)
+
+                # save label to conversation log
+                conversation_log['label'] = label_sequence[j]
                 
                 # save conversation log for this maze
                 maze_conversation_logs[i].append(conversation_log)
@@ -428,7 +434,7 @@ if __name__ == "__main__":
                 print(f"Updated prefix after move {j+1}: {prefix}")
             
             # save conversation log for this maze
-            np.save(os.path.join(conversations_dir, f"maze_{i}.npy"), maze_conversation_logs[i])
+            np.save(os.path.join(conversations_dir, f"maze_{i}.npy"), {i: maze_conversation_logs[i]})
 
             if format_failure or wrong_move:
                 continue
