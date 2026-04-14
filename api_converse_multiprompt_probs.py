@@ -10,50 +10,11 @@ from __future__ import annotations
 from termcolor import colored
 import argparse
 import os
-import sys
 from tqdm import tqdm
 
-import re
 import numpy as np
 from pathlib import Path
 from openai import OpenAI
-
-
-class _Tee:
-    """Write to a log file, and optionally also to the original stdout."""
-
-    _ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
-
-    def __init__(self, log_path: str, verbose: bool = True):
-        self._stdout = sys.stdout
-        self._verbose = verbose
-        self._log = open(log_path, "w", buffering=1, encoding="utf-8")
-
-    def write(self, data: str):
-        if self._verbose:
-            self._stdout.write(data)
-        self._log.write(self._ansi_escape.sub("", data))
-
-    def flush(self):
-        self._stdout.flush()
-        self._log.flush()
-
-    def force_print(self, *args, **kwargs):
-        """Always print to terminal and log, regardless of verbose setting."""
-        import io
-        buf = io.StringIO()
-        print(*args, file=buf, **kwargs)
-        text = buf.getvalue()
-        self._stdout.write(text)
-        self._log.write(self._ansi_escape.sub("", text))
-
-    def close(self):
-        sys.stdout = self._stdout
-        self._log.close()
-
-    # Delegate attribute lookups (e.g. `isatty`) to the real stdout.
-    def __getattr__(self, name):
-        return getattr(self._stdout, name)
 
 
 def format_maze(maze_str):
@@ -248,11 +209,11 @@ def parse_args():
                         help="Model to use for the conversation")
     parser.add_argument("--max_new_tokens", type=int, default=2048,
                         help="Max tokens for response (allow for reasoning before final answer)")
-    parser.add_argument("--temperature", type=float, default=0.7,
+    parser.add_argument("--temperature", type=float, default=1.0,
                         help="Sampling temperature")
     parser.add_argument("--top_p", type=float, default=0.9,
                         help="Top-p sampling parameter")
-    parser.add_argument("--num_rounds", type=int, default=2,
+    parser.add_argument("--num_rounds", type=int, default=4,
                         help="Number of conversation rounds between agents")
     parser.add_argument("--num_agents", type=int, default=2,
                         help="Number of agents")
@@ -262,13 +223,11 @@ def parse_args():
                         help="Number of times (K) to run each prompt for empirical probability estimation")
     parser.add_argument("--data_dir", type=str, default="out-api_exp1",
                         help="Directory containing input data")
-    parser.add_argument("--out_dir", type=str, default="out-api_exp1/test",
+    parser.add_argument("--out_dir", type=str, default="out-api_exp1/multiprompt_probs",
                         help="Directory for output logs")
-    parser.add_argument("--verbose", type=str2bool, default=True,
-                        help="Print to terminal")
     parser.add_argument("--start_maze", type=int, default=0,
                         help="Index of first maze (inclusive)")
-    parser.add_argument("--end_maze", type=int, default=50,
+    parser.add_argument("--end_maze", type=int, default=20,
                         help="Index of last maze (exclusive)")
     return parser.parse_args()
 
@@ -291,16 +250,12 @@ if __name__ == "__main__":
         "num_samples": args.num_samples,
         "data_dir": args.data_dir,
         "out_dir": args.out_dir,
-        "verbose": args.verbose,
     }
     start_maze = args.start_maze
     end_maze = args.end_maze
     num_mazes = end_maze - start_maze
 
-    # redirect all print output to out_dir/print_log.txt as well as stdout
     os.makedirs(config["out_dir"], exist_ok=True)
-    _tee = _Tee(os.path.join(config["out_dir"], "print_log.txt"), verbose=config["verbose"])
-    sys.stdout = _tee
 
     # run on dataset
     data_dir = config["data_dir"]
@@ -312,7 +267,7 @@ if __name__ == "__main__":
 
     maze_conversation_logs = {i: [] for i in range(start_maze, end_maze)} # save conversation logs for each maze
     if config["solo"]:
-        _tee.force_print(colored("Running solo full info baseline", 'light_yellow'))
+        print(colored("Running solo full info baseline", 'light_yellow'))
         config["num_agents"] = 1
         config["num_rounds"] = 1
         input_file = os.path.join(data_dir, "input_full.txt")
@@ -366,10 +321,10 @@ if __name__ == "__main__":
             success_count += 1
             print("Success! The generated path matches the label sequence.")
 
-        _tee.force_print(f"Success rate: {success_count} / {num_mazes}")
-        _tee.force_print(f"Format failure rate: {format_failure_count} / {num_mazes}")
+        print(f"Success rate: {success_count} / {num_mazes}")
+        print(f"Format failure rate: {format_failure_count} / {num_mazes}")
     else:
-        _tee.force_print(colored("Running collaborative conversation", 'light_yellow'))
+        print(colored("Running collaborative conversation", 'light_yellow'))
         input_file0 = os.path.join(data_dir, "input0.txt")
         input_file1 = os.path.join(data_dir, "input1.txt")
         with open(input_file0, "r") as f0, open(input_file1, "r") as f1:
@@ -428,7 +383,5 @@ if __name__ == "__main__":
             success_count += 1
             print("Success! The generated path matches the label sequence.")
 
-        _tee.force_print(f"Success rate: {success_count} / {num_mazes}")
-        _tee.force_print(f"Format failure rate: {format_failure_count} / {num_mazes}")
-
-    _tee.close()
+        print(f"Success rate: {success_count} / {num_mazes}")
+        print(f"Format failure rate: {format_failure_count} / {num_mazes}")
