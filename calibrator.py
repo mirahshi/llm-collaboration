@@ -15,9 +15,9 @@ class CalibrateMLP(nn.Module):
         self.answer_tokens = answer_tokens
         super().__init__()
         dim = len(self.answer_tokens)
-        self.c_fc    = nn.Linear(dim * 2, 8 * dim)
+        self.c_fc    = nn.Linear(dim * 2, 16 * dim)
         self.gelu    = nn.GELU()
-        self.c_out   = nn.Linear(8 * dim, dim)
+        self.c_out   = nn.Linear(16 * dim, dim)
 
     def forward(self, p1, p2):
         x = torch.cat((p1, p2), dim=-1)
@@ -289,7 +289,39 @@ def get_batch(probs_train, collaborator_probs_train, labels_train, probs_val, co
     return probs, collaborator_probs, labels
 
 
-def train(model, maze_conversation_logs, round, use_smECE=False, num_iters=1000, batch_size=256, learning_rate=1e-4):
+def get_learning_rate(step, base_learning_rate, total_steps, lr_scheduler="cosine", warmup_iters=0, min_learning_rate=0.0):
+    if lr_scheduler == "constant":
+        return base_learning_rate
+
+    warmup_iters = max(0, min(warmup_iters, total_steps - 1))
+    if warmup_iters > 0 and step < warmup_iters:
+        return base_learning_rate * (step + 1) / warmup_iters
+
+    decay_steps = max(1, total_steps - warmup_iters)
+    decay_progress = (step - warmup_iters) / decay_steps
+    decay_progress = min(max(decay_progress, 0.0), 1.0)
+
+    if lr_scheduler == "linear":
+        return base_learning_rate - (base_learning_rate - min_learning_rate) * decay_progress
+    if lr_scheduler == "cosine":
+        cosine_coeff = 0.5 * (1.0 + np.cos(np.pi * decay_progress))
+        return min_learning_rate + (base_learning_rate - min_learning_rate) * cosine_coeff
+
+    raise ValueError(f"Unsupported lr_scheduler: {lr_scheduler}. Use one of: constant, linear, cosine.")
+
+
+def train(
+    model,
+    maze_conversation_logs,
+    round,
+    use_smECE=False,
+    num_iters=1000,
+    batch_size=256,
+    learning_rate=1e-4,
+    lr_scheduler="cosine",
+    warmup_iters=0,
+    min_learning_rate=1e-5,
+):
     """
     Train the model on the calibration data.
     Args:
@@ -308,6 +340,10 @@ def train(model, maze_conversation_logs, round, use_smECE=False, num_iters=1000,
     train_ece_loss_base, train_cross_ece_loss_base, val_ece_loss_base, val_cross_ece_loss_base = base_calibration_losses(answer_tokens, probs_train, collaborator_probs_train, labels_train, probs_val, collaborator_probs_val, labels_val)
     print(f"Base Train ECE loss: {train_ece_loss_base.item()}, Base Train cross ECE loss: {train_cross_ece_loss_base.item()}")
     print(f"Base Val ECE loss: {val_ece_loss_base.item()}, Base Val cross ECE loss: {val_cross_ece_loss_base.item()}")
+    print(
+        f"Learning rate schedule: {lr_scheduler} "
+        f"(base_lr={learning_rate}, min_lr={min_learning_rate}, warmup_iters={warmup_iters})"
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
     ece_losses = []
@@ -318,6 +354,17 @@ def train(model, maze_conversation_logs, round, use_smECE=False, num_iters=1000,
     val_cross_ece_losses = []
 
     for i in tqdm(range(num_iters)):
+        current_lr = get_learning_rate(
+            step=i,
+            base_learning_rate=learning_rate,
+            total_steps=num_iters,
+            lr_scheduler=lr_scheduler,
+            warmup_iters=warmup_iters,
+            min_learning_rate=min_learning_rate,
+        )
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = current_lr
+
         probs, collaborator_probs, labels = get_batch(probs_train, collaborator_probs_train, labels_train, probs_val, collaborator_probs_val, labels_val, 'train', batch_size)
         logits = model(probs, collaborator_probs)
         probs = F.softmax(logits, dim=-1)
@@ -365,23 +412,37 @@ def train(model, maze_conversation_logs, round, use_smECE=False, num_iters=1000,
 
 if __name__ == "__main__":
     config = {
-        "maze_conversation_log_path": "out-api_exp2/probs-verbalized/",
-        "out_dir": "out-api_exp2/calibrator",
+        "maze_conversation_log_path": "out-api_exp3/probs-rollouts/conversations",
+        "out_dir": "out-api_exp3/calibrator",
         "answer_tokens": ['d', 'r', 'u', 'l'],
         "num_rounds": 4,
         "num_iters": 5000,
-        "use_smECE": False # use smooth ECE loss to train calibrator
+        "use_smECE": False, # use smooth ECE loss to train calibrator
+        "learning_rate": 1e-4,
+        "lr_scheduler": "cosine", # options: constant, linear, cosine
+        "warmup_iters": 0,
+        "min_learning_rate": 1e-5,
     }
 
-    # if not already labeled, label the entries
-    input_file = "out-api_exp1/input0.txt"
-    label_entries(config["maze_conversation_log_path"], input_file)
+    # # if not already labeled, label the entries
+    # input_file = "out-api_exp1/input0.txt"
+    # label_entries(config["maze_conversation_log_path"], input_file)
 
     for r in range(1, config["num_rounds"]):
         print(f"Training calibrator for round {r}")
 
         model = CalibrateMLP(config["answer_tokens"])
-        calibrated_model, ece_losses, cross_ece_losses, train_losses, val_losses, val_ece_losses, val_cross_ece_losses, train_ece_loss_base, train_cross_ece_loss_base, val_ece_loss_base, val_cross_ece_loss_base = train(model, config["maze_conversation_log_path"], r, config["use_smECE"], config["num_iters"])
+        calibrated_model, ece_losses, cross_ece_losses, train_losses, val_losses, val_ece_losses, val_cross_ece_losses, train_ece_loss_base, train_cross_ece_loss_base, val_ece_loss_base, val_cross_ece_loss_base = train(
+            model,
+            maze_conversation_logs=config["maze_conversation_log_path"],
+            round=r,
+            use_smECE=config["use_smECE"],
+            num_iters=config["num_iters"],
+            learning_rate=config["learning_rate"],
+            lr_scheduler=config["lr_scheduler"],
+            warmup_iters=config["warmup_iters"],
+            min_learning_rate=config["min_learning_rate"],
+        )
 
         # plot losses
         os.makedirs(os.path.join(config["out_dir"], "plots"), exist_ok=True)
@@ -394,14 +455,14 @@ if __name__ == "__main__":
             plt.savefig(f'{config["out_dir"]}/plots/calibrator_losses_round{r}.png')
         plt.close()
 
-        plt.plot(ece_losses, label='train ECE loss')
-        plt.plot(val_ece_losses, label='val ECE loss')
-        plt.plot(cross_ece_losses, label='train cross ECE loss')
-        plt.plot(val_cross_ece_losses, label='val cross ECE loss')
-        plt.plot([train_ece_loss_base] * len(ece_losses), label='train base ECE loss', linestyle='--')
-        plt.plot([val_ece_loss_base] * len(val_ece_losses), label='val base ECE loss', linestyle='--')
-        plt.plot([train_cross_ece_loss_base] * len(cross_ece_losses), label='train base cross ECE loss', linestyle='--')
-        plt.plot([val_cross_ece_loss_base] * len(val_cross_ece_losses), label='val base cross ECE loss', linestyle='--')
+        line1, = plt.plot(ece_losses, label='train ECE loss')
+        line2, = plt.plot(val_ece_losses, label='val ECE loss')
+        line3, = plt.plot(cross_ece_losses, label='train cross ECE loss')
+        line4, = plt.plot(val_cross_ece_losses, label='val cross ECE loss')
+        plt.plot([train_ece_loss_base] * len(ece_losses), label='train base ECE loss', linestyle='--', color=line1.get_color())
+        plt.plot([val_ece_loss_base] * len(val_ece_losses), label='val base ECE loss', linestyle='--', color=line2.get_color())
+        plt.plot([train_cross_ece_loss_base] * len(cross_ece_losses), label='train base cross ECE loss', linestyle='--', color=line3.get_color())
+        plt.plot([val_cross_ece_loss_base] * len(val_cross_ece_losses), label='val base cross ECE loss', linestyle='--', color=line4.get_color())
         plt.legend()
         if config["use_smECE"]:
             plt.savefig(f'{config["out_dir"]}/plots/calibrator_ece_losses_smECE_round{r}.png')

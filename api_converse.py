@@ -30,7 +30,7 @@ class _Tee:
     def __init__(self, log_path: str, verbose: bool = True):
         self._stdout = sys.stdout
         self._verbose = verbose
-        self._log = open(log_path, "w", buffering=1, encoding="utf-8")
+        self._log = open(log_path, "a", buffering=1, encoding="utf-8")
 
     def write(self, data: str):
         if self._verbose:
@@ -95,39 +95,45 @@ class Agent():
 
         target_tokens = ['d', 'r', 'u', 'l']
         
-        if choice.logprobs and choice.logprobs.content:
-            token_contents = choice.logprobs.content
-            delimiter_idx = None
-            for i, token_info in enumerate(token_contents):
-                if delimiter in token_info.token:
-                    delimiter_idx = i
-                    break
-            
-            if delimiter_idx is not None and delimiter_idx + 1 < len(token_contents):
-                final_answer_token_info = token_contents[delimiter_idx + 1]
-                final_answer = final_answer_token_info.token.strip()
-                if final_answer not in target_tokens:
+        # Parse final answer from response string
+        answer_match = re.search(re.escape(delimiter) + r'\s*([drul])', full_response, re.IGNORECASE)
+        if answer_match:
+            final_answer = answer_match.group(1).lower()
+            if final_answer not in target_tokens:
+                format_failure = True
+        else:
+            print(colored(f"Warning: Delimiter '{delimiter}' followed by a valid move not found in response", 'light_red'))
+            format_failure = True
+
+        if not format_failure:
+            if self.config['verbalize_probabilities']: # get probabilities from response
+                prob_match = re.search(r'%\s*\[([^\]]+)\]', full_response)
+                if prob_match:
+                    prob_str = prob_match.group(1)
+                    prob_vector = [float(p.strip()) for p in prob_str.split(',')]
+                if prob_vector is None or len(prob_vector) != 4:
+                    print(colored(f"Warning: Probabilities for [d,r,u,l] should be 4 numbers, got {prob_vector}", 'light_red'))
+                    prob_vector = None
                     format_failure = True
-                
-                if self.config['verbalize_probabilities']: # get probabilities from response
-                    prob_match = re.search(r'%\s*\[([^\]]+)\]', full_response)
-                    if prob_match:
-                        prob_str = prob_match.group(1)
-                        prob_vector = [float(p.strip()) for p in prob_str.split(',')]
-                    if prob_vector is None or len(prob_vector) != 4:
-                        print(colored(f"Warning: Probabilities for [d,r,u,l] should be 4 numbers, got {prob_vector}", 'light_red'))
-                        prob_vector = None
-                        format_failure = True
-                elif self.config['append_probabilities']: # get probabilities from logprobs
+            elif self.config['append_probabilities'] and choice.logprobs and choice.logprobs.content: # get probabilities from logprobs
+                token_contents = choice.logprobs.content
+                # find the token corresponding to the final answer after the delimiter
+                final_answer_token_info = None
+                for i, token_info in enumerate(token_contents):
+                    if delimiter in token_info.token:
+                        after_delim = token_info.token[token_info.token.find(delimiter) + 1:].strip()
+                        if after_delim:
+                            final_answer_token_info = token_info
+                        elif i + 1 < len(token_contents):
+                            final_answer_token_info = token_contents[i + 1]
+                        break
+                if final_answer_token_info is not None:
                     prob_vector = [0.0, 0.0, 0.0, 0.0]  # d, r, u, l
                     for entry in final_answer_token_info.top_logprobs:
                         token = entry.token.strip().lower()
                         if token in target_tokens:
                             idx = target_tokens.index(token)
                             prob_vector[idx] += math.exp(entry.logprob)
-            else:
-                print(colored(f"Warning: Delimiter '{delimiter}' not found or no token after delimiter", 'light_red'))
-                format_failure = True
 
         return full_response, final_answer, prob_vector, format_failure
 
@@ -366,7 +372,8 @@ if __name__ == "__main__":
         with open(input_file, "r") as f:
             input_lines = f.readlines()
         for i, input_line in tqdm(enumerate(input_lines[start_maze:end_maze], start=start_maze)):
-            print(colored(f"Maze line {i}: ======================================================", 'light_magenta'))
+            maze_idx = i
+            print(colored(f"Maze line {maze_idx}: ======================================================", 'light_magenta'))
             maze_str = input_line.split('=')[0].strip()
             label_sequence = input_line.split('=')[1].strip()
 
@@ -383,7 +390,7 @@ if __name__ == "__main__":
                 conversation_log['label'] = label_sequence[j]
                 
                 # save conversation log for this maze
-                maze_conversation_logs[i].append(conversation_log)
+                maze_conversation_logs[maze_idx].append(conversation_log)
                 
                 # move onto next maze if there is a format failure
                 format_failure = conversation_log['format_failures'][-1]
@@ -403,7 +410,7 @@ if __name__ == "__main__":
                 print(f"Updated prefix after move {j+1}: {prefix}")
             
             # save conversation log for this maze
-            np.save(os.path.join(conversations_dir, f"maze_{i}.npy"), {i: maze_conversation_logs[i]})
+            np.save(os.path.join(conversations_dir, f"maze_{maze_idx}.npy"), {maze_idx: maze_conversation_logs[maze_idx]})
 
             if conversation_log['format_failures'][-1] or wrong_move:
                 continue
@@ -423,7 +430,8 @@ if __name__ == "__main__":
             input_lines0 = f0.readlines()
             input_lines1 = f1.readlines()
         for i, (input_line0, input_line1) in tqdm(enumerate(zip(input_lines0[start_maze:end_maze], input_lines1[start_maze:end_maze]), start=start_maze)):
-            print(colored(f"Maze line {i}: ======================================================", 'light_magenta'))
+            maze_idx = i
+            print(colored(f"Maze line {maze_idx}: ======================================================", 'light_magenta'))
             maze_str0 = input_line0.split('=')[0].strip()
             maze_str1 = input_line1.split('=')[0].strip()
             label_sequence = input_line0.split('=')[1].strip()
@@ -445,7 +453,7 @@ if __name__ == "__main__":
                 conversation_log['label'] = label_sequence[j]
                 
                 # save conversation log for this maze
-                maze_conversation_logs[i].append(conversation_log)
+                maze_conversation_logs[maze_idx].append(conversation_log)
                 
                 # move onto next maze if there is a format failure
                 format_failure = conversation_log['format_failures'][-1]
@@ -465,7 +473,7 @@ if __name__ == "__main__":
                 print(f"Updated prefix after move {j+1}: {prefix}")
             
             # save conversation log for this maze
-            np.save(os.path.join(conversations_dir, f"maze_{i}.npy"), {i: maze_conversation_logs[i]})
+            np.save(os.path.join(conversations_dir, f"maze_{maze_idx}.npy"), {maze_idx: maze_conversation_logs[maze_idx]})
 
             if format_failure or wrong_move:
                 continue
