@@ -16,6 +16,8 @@ import numpy as np
 from pathlib import Path
 from openai import OpenAI
 
+from calibrator import load_calibrator, calibrate_probabilities
+
 
 def format_maze(maze_str):
     maze_size = int(len(maze_str) ** 0.5)
@@ -110,11 +112,13 @@ def api_converse(config, client, starting_prompts):
         'full_responses': [],
         'final_answers': [],
         'prob_vectors': [],
+        'calibrated_prob_vectors': [],
         'format_failures': [],
     }
 
     # conversation loop
     prompt = ""
+    prev_prob_vector = None
     for r in range(config['num_rounds']):
         print(colored(f"ROUND {r}: =================================================", 'light_yellow'))
         agent_id = r % config['num_agents']  # determine which agent acts this round
@@ -137,12 +141,32 @@ def api_converse(config, client, starting_prompts):
         print(colored(f"Final answer: {final_answer}", 'light_green'))
         print(colored(f"Probabilities for [d,r,u,l]: {rounded_prob_vector}", 'light_magenta'))
 
+        # Apply calibration if we have a calibrator and previous round probabilities
+        calibrated_prob_vector = None
+        if config.get('calibrator_models') is not None and prob_vector is not None and prev_prob_vector is not None:
+            calibrated_prob_vector = calibrate_probabilities(
+                config['calibrator_models'][r], prob_vector, prev_prob_vector
+            )
+            rounded_calibrated = [round(p, 4) for p in calibrated_prob_vector]
+            print(colored(f"Calibrated probabilities for [d,r,u,l]: {rounded_calibrated}", 'light_cyan'))
+        conversation_log['calibrated_prob_vectors'].append(calibrated_prob_vector)
+
         # stop the conversation if there is a format failure
         if format_failure:
             break
 
         # update prompt for next round
-        prompt = f"The other agent answered with probabilities for [d,r,u,l]: {rounded_prob_vector}."
+        # Use calibrated probabilities if available, otherwise use raw probabilities
+        probs_for_prompt = calibrated_prob_vector if calibrated_prob_vector is not None else prob_vector
+        if probs_for_prompt is not None:
+            rounded_probs_for_prompt = [round(p, 4) for p in probs_for_prompt]
+        else:
+            rounded_probs_for_prompt = rounded_prob_vector
+
+        prompt = f"The other agent answered with probabilities for [d,r,u,l]: {rounded_probs_for_prompt}."
+
+        # Track previous round's probabilities for calibration
+        prev_prob_vector = prob_vector
 
     return conversation_log
 
@@ -221,6 +245,8 @@ def parse_args():
                         help="Run solo full info baseline instead of collaborative game")
     parser.add_argument("--num_samples", type=int, default=10,
                         help="Number of times (K) to run each prompt for empirical probability estimation")
+    parser.add_argument("--calibrator_path", type=str, default=None,
+                        help="Path to directory containing trained calibrator models (e.g., calibrator_plots/)")
     parser.add_argument("--data_dir", type=str, default="out-api_exp1",
                         help="Directory containing input data")
     parser.add_argument("--out_dir", type=str, default="out-api_exp1/multiprompt_probs",
@@ -239,6 +265,15 @@ if __name__ == "__main__":
     api_key = Path("gpt_api_key.txt").read_text().strip()
     client = OpenAI(api_key=api_key)
 
+    # Load calibrators if specified
+    calibrator_models = None
+    if args.calibrator_path:
+        calibrator_models = {}
+        for r in range(1, args.num_rounds): # no calibrator for round 0
+            calibrator_model, _, calibrator_round = load_calibrator(os.path.join(args.calibrator_path, f"calibrator_round{r}.pt"))
+            print(f"Loaded calibrator from {os.path.join(args.calibrator_path, f'calibrator_round{r}.pt')} (trained on round {calibrator_round})")
+            calibrator_models[r] = calibrator_model
+
     config = {
         "model_name": args.model_name,
         "max_new_tokens": args.max_new_tokens,
@@ -248,6 +283,7 @@ if __name__ == "__main__":
         "num_agents": args.num_agents,
         "solo": args.solo,
         "num_samples": args.num_samples,
+        "calibrator_models": calibrator_models,
         "data_dir": args.data_dir,
         "out_dir": args.out_dir,
     }

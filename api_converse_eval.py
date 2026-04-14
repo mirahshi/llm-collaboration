@@ -1,6 +1,17 @@
 import numpy as np
 import os
 from termcolor import colored
+from glob import glob
+
+def get_maze_conversation_logs(maze_conversation_log_path):
+    maze_conversation_logs = {}
+    maze_paths = glob(os.path.join(maze_conversation_log_path, 'maze_*.npy'))
+    for maze_path in maze_paths:
+        maze_conversation_logs_loaded = np.load(maze_path, allow_pickle=True).item()
+        # append contents of maze_conversation_logs_loaded to maze_conversation_logs
+        maze_conversation_logs.update(maze_conversation_logs_loaded)
+    print("maze_conversation_logs: ", len(maze_conversation_logs))
+    return maze_conversation_logs
 
 def get_maze_conversation_logs_no_format_failures(maze_conversation_logs):
     """
@@ -122,17 +133,19 @@ def measure_maze_success_rates(maze_conversation_logs, label_sequences):
 
 
 if __name__ == "__main__":
-    group_name = "api_exp2"
     data_dir = 'out-api_exp1'
-    run_names = ["probs-verbalized", "actions-verbalized"]
+    group_name = "api_exp3"
+    run_names = ["probs-rollouts"]
     # run_names = ["probs-verbalized-gpt-4.1"]
 
     # Load and filter all conditions first
     all_logs = {}
     all_filtered_logs = {}
     for run_name in run_names:
-        out_dir = f'/vast/projects/surbhig/multi-agent-collab/out-{group_name}/{run_name}'
-        maze_conversation_logs = np.load(os.path.join(out_dir, 'maze_conversation_logs.npy'), allow_pickle=True).item()
+        out_dir = f'out-{group_name}/{run_name}'
+        maze_conversation_logs_path = os.path.join(out_dir, 'conversations')
+        maze_conversation_logs = get_maze_conversation_logs(maze_conversation_logs_path)
+        # maze_conversation_logs = np.load(os.path.join(out_dir, 'maze_conversation_logs.npy'), allow_pickle=True).item()
         all_logs[run_name] = maze_conversation_logs
         all_filtered_logs[run_name] = get_maze_conversation_logs_no_format_failures(maze_conversation_logs)
         print(f"{run_name}: {len(all_filtered_logs[run_name])} mazes with no format failures")
