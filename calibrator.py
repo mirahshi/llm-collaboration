@@ -214,14 +214,18 @@ def generate_calibration_data(maze_conversation_log_path, round):
 
     answer_to_indices = {'d': 0, 'r': 1, 'u': 2, 'l': 3}
 
-    maze_paths = glob(os.path.join(maze_conversation_log_path, 'maze_*.npy'))
+    # maze_paths = glob(os.path.join(maze_conversation_log_path, 'maze_*.npy'))
+    maze_paths = [os.path.join(maze_conversation_log_path, f"maze_{0}.npy")]
     for maze_path in maze_paths:
         maze_conversation_logs = np.load(maze_path, allow_pickle=True).item()
         maze_conversation_logs = get_maze_conversation_logs_no_format_failures(maze_conversation_logs)
         for i, conversation_logs in maze_conversation_logs.items():
             for j, conversation_log in enumerate(conversation_logs):
                 prob = conversation_log['prob_vectors'][round]
-                collaborator_prob = conversation_log['prob_vectors'][round - 1]
+                if round > 1: # for round 2 and beyond, use calibrated probabilities from previous round
+                    collaborator_prob = conversation_log['calibrated_prob_vectors'][round - 1]
+                else: # for round 1, use raw probabilities from round 0
+                    collaborator_prob = conversation_log['prob_vectors'][round - 1]
                 label_token = conversation_log['label']
 
                 probs.append(prob)
@@ -411,11 +415,18 @@ def train(
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train calibrator for maze conversations.")
+    parser.add_argument("--maze_conversation_log_path", type=str, default="out-api_exp3/probs-rollouts/conversations", help="Path to maze conversation logs")
+    parser.add_argument("--out_dir", type=str, default="out-api_exp3/calibrator", help="Output directory for calibration results")
+    parser.add_argument("--round", type=int, default=1, help="Round to train calibrator for")
+    args = parser.parse_args()
     config = {
-        "maze_conversation_log_path": "out-api_exp3/probs-rollouts/conversations",
-        "out_dir": "out-api_exp3/calibrator",
+        "maze_conversation_log_path": args.maze_conversation_log_path,
+        "out_dir": args.out_dir,
         "answer_tokens": ['d', 'r', 'u', 'l'],
-        "num_rounds": 4,
+        "round": args.round,
         "num_iters": 5000,
         "use_smECE": False, # use smooth ECE loss to train calibrator
         "learning_rate": 1e-4,
@@ -428,53 +439,53 @@ if __name__ == "__main__":
     # input_file = "out-api_exp1/input0.txt"
     # label_entries(config["maze_conversation_log_path"], input_file)
 
-    for r in range(1, config["num_rounds"]):
-        print(f"Training calibrator for round {r}")
+    r = config["round"]
+    print(f"Training calibrator for round {r}")
 
-        model = CalibrateMLP(config["answer_tokens"])
-        calibrated_model, ece_losses, cross_ece_losses, train_losses, val_losses, val_ece_losses, val_cross_ece_losses, train_ece_loss_base, train_cross_ece_loss_base, val_ece_loss_base, val_cross_ece_loss_base = train(
-            model,
-            maze_conversation_logs=config["maze_conversation_log_path"],
-            round=r,
-            use_smECE=config["use_smECE"],
-            num_iters=config["num_iters"],
-            learning_rate=config["learning_rate"],
-            lr_scheduler=config["lr_scheduler"],
-            warmup_iters=config["warmup_iters"],
-            min_learning_rate=config["min_learning_rate"],
-        )
+    model = CalibrateMLP(config["answer_tokens"])
+    calibrated_model, ece_losses, cross_ece_losses, train_losses, val_losses, val_ece_losses, val_cross_ece_losses, train_ece_loss_base, train_cross_ece_loss_base, val_ece_loss_base, val_cross_ece_loss_base = train(
+        model,
+        maze_conversation_logs=config["maze_conversation_log_path"],
+        round=r,
+        use_smECE=config["use_smECE"],
+        num_iters=config["num_iters"],
+        learning_rate=config["learning_rate"],
+        lr_scheduler=config["lr_scheduler"],
+        warmup_iters=config["warmup_iters"],
+        min_learning_rate=config["min_learning_rate"],
+    )
 
-        # plot losses
-        os.makedirs(os.path.join(config["out_dir"], "plots"), exist_ok=True)
-        plt.plot(train_losses, label='train loss')
-        plt.plot(val_losses, label='val loss')
-        plt.legend()
-        if config["use_smECE"]:
-            plt.savefig(f'{config["out_dir"]}/plots/calibrator_losses_smECE_round{r}.png')
-        else:   
-            plt.savefig(f'{config["out_dir"]}/plots/calibrator_losses_round{r}.png')
-        plt.close()
+    # plot losses
+    os.makedirs(os.path.join(config["out_dir"], "plots"), exist_ok=True)
+    plt.plot(train_losses, label='train loss')
+    plt.plot(val_losses, label='val loss')
+    plt.legend()
+    if config["use_smECE"]:
+        plt.savefig(f'{config["out_dir"]}/plots/calibrator_losses_smECE_round{r}.png')
+    else:   
+        plt.savefig(f'{config["out_dir"]}/plots/calibrator_losses_round{r}.png')
+    plt.close()
 
-        line1, = plt.plot(ece_losses, label='train ECE loss')
-        line2, = plt.plot(val_ece_losses, label='val ECE loss')
-        line3, = plt.plot(cross_ece_losses, label='train cross ECE loss')
-        line4, = plt.plot(val_cross_ece_losses, label='val cross ECE loss')
-        plt.plot([train_ece_loss_base] * len(ece_losses), label='train base ECE loss', linestyle='--', color=line1.get_color())
-        plt.plot([val_ece_loss_base] * len(val_ece_losses), label='val base ECE loss', linestyle='--', color=line2.get_color())
-        plt.plot([train_cross_ece_loss_base] * len(cross_ece_losses), label='train base cross ECE loss', linestyle='--', color=line3.get_color())
-        plt.plot([val_cross_ece_loss_base] * len(val_cross_ece_losses), label='val base cross ECE loss', linestyle='--', color=line4.get_color())
-        plt.legend()
-        if config["use_smECE"]:
-            plt.savefig(f'{config["out_dir"]}/plots/calibrator_ece_losses_smECE_round{r}.png')
-        else:
-            plt.savefig(f'{config["out_dir"]}/plots/calibrator_ece_losses_round{r}.png')
-        plt.close()
+    line1, = plt.plot(ece_losses, label='train ECE loss')
+    line2, = plt.plot(val_ece_losses, label='val ECE loss')
+    line3, = plt.plot(cross_ece_losses, label='train cross ECE loss')
+    line4, = plt.plot(val_cross_ece_losses, label='val cross ECE loss')
+    plt.plot([train_ece_loss_base] * len(ece_losses), label='train base ECE loss', linestyle='--', color=line1.get_color())
+    plt.plot([val_ece_loss_base] * len(val_ece_losses), label='val base ECE loss', linestyle='--', color=line2.get_color())
+    plt.plot([train_cross_ece_loss_base] * len(cross_ece_losses), label='train base cross ECE loss', linestyle='--', color=line3.get_color())
+    plt.plot([val_cross_ece_loss_base] * len(val_cross_ece_losses), label='val base cross ECE loss', linestyle='--', color=line4.get_color())
+    plt.legend()
+    if config["use_smECE"]:
+        plt.savefig(f'{config["out_dir"]}/plots/calibrator_ece_losses_smECE_round{r}.png')
+    else:
+        plt.savefig(f'{config["out_dir"]}/plots/calibrator_ece_losses_round{r}.png')
+    plt.close()
 
-        # Save the calibrated model
-        model_path = os.path.join(config["out_dir"], f"calibrator_round{r}.pt")
-        torch.save({
-            'model_state_dict': calibrated_model.state_dict(),
-            'answer_tokens': config["answer_tokens"],
-            'round': r,
-        }, model_path)
-        print(f"Saved calibrated model to {model_path}")
+    # Save the calibrated model
+    model_path = os.path.join(config["out_dir"], f"calibrator_round{r}.pt")
+    torch.save({
+        'model_state_dict': calibrated_model.state_dict(),
+        'answer_tokens': config["answer_tokens"],
+        'round': r,
+    }, model_path)
+    print(f"Saved calibrated model to {model_path}")
