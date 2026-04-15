@@ -10,13 +10,52 @@ from __future__ import annotations
 from termcolor import colored
 import argparse
 import os
+import sys
 from tqdm import tqdm
 
+import re
 import numpy as np
 from pathlib import Path
 from openai import OpenAI
 
 from calibrator import load_calibrator, calibrate_probabilities
+
+
+class _Tee:
+    """Write to a log file, and optionally also to the original stdout."""
+
+    _ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
+
+    def __init__(self, log_path: str, verbose: bool = True):
+        self._stdout = sys.stdout
+        self._verbose = verbose
+        self._log = open(log_path, "w", buffering=1, encoding="utf-8")
+
+    def write(self, data: str):
+        if self._verbose:
+            self._stdout.write(data)
+        self._log.write(self._ansi_escape.sub("", data))
+
+    def flush(self):
+        self._stdout.flush()
+        self._log.flush()
+
+    def force_print(self, *args, **kwargs):
+        """Always print to terminal and log, regardless of verbose setting."""
+        import io
+        buf = io.StringIO()
+        print(*args, file=buf, **kwargs)
+        text = buf.getvalue()
+        self._stdout.write(text)
+        self._log.write(self._ansi_escape.sub("", text))
+
+    def close(self):
+        sys.stdout = self._stdout
+        self._log.close()
+
+    # Delegate attribute lookups (e.g. `isatty`) to the real stdout.
+    def __getattr__(self, name):
+        return getattr(self._stdout, name)
 
 
 def format_maze(maze_str):
@@ -100,7 +139,7 @@ class Agent():
         return full_response, final_answer, prob_vector, format_failure
 
 
-def api_converse(config, client, starting_prompts):
+def api_converse(config, client, starting_prompts, prior_conversation_log=None):
     # initialize agents
     agents = {
         agent_id: Agent(config, 0, agent_id, client)
@@ -108,18 +147,60 @@ def api_converse(config, client, starting_prompts):
     }
 
     # save per-round responses
-    conversation_log = {
-        'full_responses': [],
-        'final_answers': [],
-        'prob_vectors': [],
-        'calibrated_prob_vectors': [],
-        'format_failures': [],
-    }
+    if prior_conversation_log is None:
+        conversation_log = {
+            'full_responses': [],
+            'final_answers': [],
+            'prob_vectors': [],
+            'calibrated_prob_vectors': [],
+            'format_failures': [],
+        }
+    else: # use prior conversation log to continue the conversation
+        conversation_log = prior_conversation_log
 
     # conversation loop
-    prompt = ""
-    prev_prob_vector = None
-    for r in range(config['num_rounds']):
+    if config['start_round'] == 0:
+        prompt = ""
+        prev_prob_vector = None
+    else:
+        # Get the last calibrated probabilities from prior conversation log at round config['start_round'] if it exists
+        # If not available, compute them using the calibrator for the previous round
+        num_calibrated_rounds = len(prior_conversation_log['calibrated_prob_vectors'])
+        if num_calibrated_rounds >= config['start_round']:
+            prompt_probs = prior_conversation_log['calibrated_prob_vectors'][config['start_round']]
+        else:
+            # Need to compute calibrated probs for the last round in prior log
+            prev_round = config['start_round'] - 1
+            if config.get('calibrator_models') is not None and prev_round in config['calibrator_models']:
+                # Get raw probs from prior log
+                current_raw = prior_conversation_log['prob_vectors'][-1]  # p_{r-1} raw
+                # Get the probs from the round before that (calibrated if available, else raw)
+                if len(prior_conversation_log['prob_vectors']) >= 2:
+                    if len(prior_conversation_log['calibrated_prob_vectors']) >= 2 and prior_conversation_log['calibrated_prob_vectors'][-2] is not None:
+                        prev_prev = prior_conversation_log['calibrated_prob_vectors'][-2]
+                    else:
+                        prev_prev = prior_conversation_log['prob_vectors'][-2]
+                    # Apply calibrator for prev_round to get calibrated probs
+                    prompt_probs = calibrate_probabilities(
+                        config['calibrator_models'][prev_round], current_raw, prev_prev
+                    )
+                    # Round and renormalize
+                    prompt_probs = [round(p, 2) for p in prompt_probs]
+                    diff = round(1.00 - sum(prompt_probs), 2)
+                    largest_idx = np.argmax(prompt_probs)
+                    prompt_probs[largest_idx] = prompt_probs[largest_idx] + diff
+                    print(colored(f"Applied calibrator_round{prev_round} to get calibrated probs: {prompt_probs}", 'light_cyan'))
+                    # Save the computed calibrated probs back to conversation_log
+                    conversation_log['calibrated_prob_vectors'].append(prompt_probs)
+                else:
+                    prompt_probs = current_raw
+            else:
+                prompt_probs = prior_conversation_log['prob_vectors'][-1]
+        
+        prompt = f"The other agent answered with probabilities for [d,r,u,l]: {prompt_probs}."
+        # Initialize prev_prob_vector from the (calibrated) probs so calibration is applied on first round
+        prev_prob_vector = prompt_probs
+    for r in range(config['start_round'], config['end_round']):
         print(colored(f"ROUND {r}: =================================================", 'light_yellow'))
         agent_id = r % config['num_agents']  # determine which agent acts this round
         agent = agents[agent_id]
@@ -142,41 +223,41 @@ def api_converse(config, client, starting_prompts):
         print(colored(f"Final answer: {final_answer}", 'light_green'))
         print(colored(f"Probabilities for [d,r,u,l]: {renormalized_prob_vector}", 'light_magenta'))
 
-        # Apply calibration if we have a calibrator and previous round probabilities
-        calibrated_prob_vector = None
-        if config.get('calibrator_models') is not None and prob_vector is not None and prev_prob_vector is not None:
-            calibrated_prob_vector = calibrate_probabilities(
-                config['calibrator_models'][r], renormalized_prob_vector, prev_prob_vector
-            )
-            rounded_calibrated_prob_vector = [round(p, 2) for p in calibrated_prob_vector]
-            # renormalize to sum to 1
-            diff = round(1.00 - sum(rounded_calibrated_prob_vector), 2)
-            largest_element_idx = np.argmax(rounded_calibrated_prob_vector)
-            rounded_calibrated_prob_vector[largest_element_idx] = rounded_calibrated_prob_vector[largest_element_idx] + diff
-            renormalized_calibrated_prob_vector = [round(p, 2) for p in rounded_calibrated_prob_vector]
-            print(colored(f"Calibrated probabilities for [d,r,u,l]: {renormalized_calibrated_prob_vector}", 'light_cyan'))
-        else:
-            renormalized_calibrated_prob_vector = None
+        # # Apply calibration if we have a calibrator and previous round probabilities
+        # calibrated_prob_vector = None
+        # if config.get('calibrator_models') is not None and r in config['calibrator_models'] and prob_vector is not None and prev_prob_vector is not None:
+        #     calibrated_prob_vector = calibrate_probabilities(
+        #         config['calibrator_models'][r], renormalized_prob_vector, prev_prob_vector
+        #     )
+        #     rounded_calibrated_prob_vector = [round(p, 2) for p in calibrated_prob_vector]
+        #     # renormalize to sum to 1
+        #     diff = round(1.00 - sum(rounded_calibrated_prob_vector), 2)
+        #     largest_element_idx = np.argmax(rounded_calibrated_prob_vector)
+        #     rounded_calibrated_prob_vector[largest_element_idx] = rounded_calibrated_prob_vector[largest_element_idx] + diff
+        #     renormalized_calibrated_prob_vector = [round(p, 2) for p in rounded_calibrated_prob_vector]
+        #     print(colored(f"Calibrated probabilities for [d,r,u,l]: {renormalized_calibrated_prob_vector}", 'light_cyan'))
+        # else:
+        #     renormalized_calibrated_prob_vector = None
         
         # save responses for this round
         conversation_log['full_responses'].append(full_response)
         conversation_log['final_answers'].append(final_answer)
         conversation_log['prob_vectors'].append(renormalized_prob_vector)
-        conversation_log['calibrated_prob_vectors'].append(renormalized_calibrated_prob_vector)
+        # conversation_log['calibrated_prob_vectors'].append(renormalized_calibrated_prob_vector)
         conversation_log['format_failures'].append(format_failure)
 
         # stop the conversation if there is a format failure
         if format_failure:
             break
 
-        # update prompt for next round
-        # Use calibrated probabilities if available, otherwise use raw probabilities
-        probs_for_prompt = renormalized_calibrated_prob_vector if renormalized_calibrated_prob_vector is not None else renormalized_prob_vector
+        # # update prompt for next round
+        # # Use calibrated probabilities if available, otherwise use raw probabilities
+        # probs_for_prompt = renormalized_calibrated_prob_vector if renormalized_calibrated_prob_vector is not None else renormalized_prob_vector
 
-        prompt = f"The other agent answered with probabilities for [d,r,u,l]: {probs_for_prompt}."
+        # prompt = f"The other agent answered with probabilities for [d,r,u,l]: {probs_for_prompt}."
 
-        # Track previous round's probabilities for calibration
-        prev_prob_vector = probs_for_prompt
+        # # Track previous round's probabilities for calibration
+        # prev_prob_vector = probs_for_prompt
 
     return conversation_log
 
@@ -243,11 +324,11 @@ def parse_args():
                         help="Model to use for the conversation")
     parser.add_argument("--max_new_tokens", type=int, default=2048,
                         help="Max tokens for response (allow for reasoning before final answer)")
-    parser.add_argument("--temperature", type=float, default=1.0,
+    parser.add_argument("--temperature", type=float, default=0.7,
                         help="Sampling temperature")
     parser.add_argument("--top_p", type=float, default=0.9,
                         help="Top-p sampling parameter")
-    parser.add_argument("--num_rounds", type=int, default=4,
+    parser.add_argument("--num_rounds", type=int, default=2,
                         help="Number of conversation rounds between agents")
     parser.add_argument("--num_agents", type=int, default=2,
                         help="Number of agents")
@@ -259,12 +340,18 @@ def parse_args():
                         help="Path to directory containing trained calibrator models (e.g., calibrator_plots/)")
     parser.add_argument("--data_dir", type=str, default="out-api_exp1",
                         help="Directory containing input data")
-    parser.add_argument("--out_dir", type=str, default="out-api_exp1/multiprompt_probs",
+    parser.add_argument("--out_dir", type=str, default="out-api_exp1/test",
                         help="Directory for output logs")
+    parser.add_argument("--verbose", type=str2bool, default=True,
+                        help="Print to terminal")
     parser.add_argument("--start_maze", type=int, default=0,
                         help="Index of first maze (inclusive)")
-    parser.add_argument("--end_maze", type=int, default=20,
+    parser.add_argument("--end_maze", type=int, default=50,
                         help="Index of last maze (exclusive)")
+    parser.add_argument("--start_round", type=int, default=0,
+                        help="Index of first round (inclusive)")
+    parser.add_argument("--end_round", type=int, default=4,
+                        help="Index of last round (exclusive)")
     return parser.parse_args()
 
 
@@ -279,10 +366,13 @@ if __name__ == "__main__":
     calibrator_models = None
     if args.calibrator_path:
         calibrator_models = {}
-        for r in range(1, args.num_rounds): # no calibrator for round 0
+        for r in range(1, args.start_round): # no calibrator for round 0
             calibrator_model, _, calibrator_round = load_calibrator(os.path.join(args.calibrator_path, f"calibrator_round{r}.pt"))
             print(f"Loaded calibrator from {os.path.join(args.calibrator_path, f'calibrator_round{r}.pt')} (trained on round {calibrator_round})")
             calibrator_models[r] = calibrator_model
+
+    start_round = args.start_round
+    end_round = args.end_round
 
     config = {
         "model_name": args.model_name,
@@ -294,14 +384,20 @@ if __name__ == "__main__":
         "solo": args.solo,
         "num_samples": args.num_samples,
         "calibrator_models": calibrator_models,
+        "start_round": start_round,
+        "end_round": end_round,
         "data_dir": args.data_dir,
         "out_dir": args.out_dir,
+        "verbose": args.verbose,
     }
     start_maze = args.start_maze
     end_maze = args.end_maze
     num_mazes = end_maze - start_maze
 
+    # redirect all print output to out_dir/print_log.txt as well as stdout
     os.makedirs(config["out_dir"], exist_ok=True)
+    _tee = _Tee(os.path.join(config["out_dir"], "print_log.txt"), verbose=config["verbose"])
+    sys.stdout = _tee
 
     # run on dataset
     data_dir = config["data_dir"]
@@ -313,7 +409,7 @@ if __name__ == "__main__":
 
     maze_conversation_logs = {i: [] for i in range(start_maze, end_maze)} # save conversation logs for each maze
     if config["solo"]:
-        print(colored("Running solo full info baseline", 'light_yellow'))
+        _tee.force_print(colored("Running solo full info baseline", 'light_yellow'))
         config["num_agents"] = 1
         config["num_rounds"] = 1
         input_file = os.path.join(data_dir, "input_full.txt")
@@ -367,10 +463,10 @@ if __name__ == "__main__":
             success_count += 1
             print("Success! The generated path matches the label sequence.")
 
-        print(f"Success rate: {success_count} / {num_mazes}")
-        print(f"Format failure rate: {format_failure_count} / {num_mazes}")
+        _tee.force_print(f"Success rate: {success_count} / {num_mazes}")
+        _tee.force_print(f"Format failure rate: {format_failure_count} / {num_mazes}")
     else:
-        print(colored("Running collaborative conversation", 'light_yellow'))
+        _tee.force_print(colored("Running collaborative conversation", 'light_yellow'))
         input_file0 = os.path.join(data_dir, "input0.txt")
         input_file1 = os.path.join(data_dir, "input1.txt")
         with open(input_file0, "r") as f0, open(input_file1, "r") as f1:
@@ -386,14 +482,22 @@ if __name__ == "__main__":
             # maze_str1 = "@..????.?#?.#?#.??##?.???.????.?#.?*"
             # label_sequence = "rrrrrddlddrd"
 
+            if start_round > 0: # get conversation logs for this maze with data from previous rounds
+                prior_conversation_logs = np.load(os.path.join(conversations_dir, f"maze_{i}.npy"), allow_pickle=True).item()
+
             prefix = ""
             # autoregessively generate the path
             wrong_move = False
             for j in range(len(label_sequence)):
             # for i in range(3):
                 print(colored(f"MOVE {j+1}: ======================================================", 'light_green'))
+                
                 starting_prompts = [generate_starting_prompt(config, maze_str0, prefix, solo=False), generate_starting_prompt(config, maze_str1, prefix, solo=False)]    
-                conversation_log = api_converse(config, client, starting_prompts)
+                if start_round == 0:
+                    prior_conversation_log = None
+                else:
+                    prior_conversation_log = prior_conversation_logs[i][j]                   
+                conversation_log = api_converse(config, client, starting_prompts, prior_conversation_log)
 
                 # save label to conversation log
                 conversation_log['label'] = label_sequence[j]
@@ -429,5 +533,7 @@ if __name__ == "__main__":
             success_count += 1
             print("Success! The generated path matches the label sequence.")
 
-        print(f"Success rate: {success_count} / {num_mazes}")
-        print(f"Format failure rate: {format_failure_count} / {num_mazes}")
+        _tee.force_print(f"Success rate: {success_count} / {num_mazes}")
+        _tee.force_print(f"Format failure rate: {format_failure_count} / {num_mazes}")
+
+    _tee.close()
