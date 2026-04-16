@@ -86,29 +86,33 @@ class Agent():
 
         print(colored(f"===== BEGIN K={K} BLOCK =====", 'light_grey'))
         for k in range(K):
-            response = self.client.chat.completions.create(
-                model=self.config['model_name'],
-                messages=[{"role": "user", "content": prompt}],
-                max_completion_tokens=self.config['max_new_tokens'],
-                temperature=self.config['temperature'],
-                top_p=self.config['top_p'],
-            )
-            choice = response.choices[0]
-            text = choice.message.content.strip()
-            responses.append(text)
+            valid_response = False
+            num_attempts = 5
+            while not valid_response:
+                response = self.client.chat.completions.create(
+                    model=self.config['model_name'],
+                    messages=[{"role": "user", "content": prompt}],
+                    max_completion_tokens=self.config['max_new_tokens'],
+                    temperature=self.config['temperature'],
+                    top_p=self.config['top_p'],
+                )
+                choice = response.choices[0]
+                text = choice.message.content.strip()
+                responses.append(text)
 
-            # parse the final answer after the delimiter
-            answer = None
-            parts = text.split(delimiter)
-            if len(parts) >= 2:
-                answer = parts[-1].strip().lower()
-                if len(answer) > 0:
-                    answer = answer[0]
-                if answer in target_tokens:
-                    counts[target_tokens.index(answer)] += 1
-                    valid_count += 1
-                else:
-                    answer = None
+                # parse the final answer after the delimiter
+                answer = None
+                parts = text.split(delimiter)
+                if len(parts) >= 2:
+                    answer = parts[-1].strip().lower()
+                    if len(answer) > 0:
+                        answer = answer[0]
+                    if answer in target_tokens:
+                        counts[target_tokens.index(answer)] += 1
+                        valid_count += 1
+                        valid_response = True
+                    else:
+                        answer = None
 
             print(colored(f"--- sample {k+1}/{K} ---", 'light_grey'))
             print(text)
@@ -167,19 +171,22 @@ def api_converse(config, client, starting_prompts, prior_conversation_log=None):
         # If not available, compute them using the calibrator for the previous round
         num_calibrated_rounds = len(prior_conversation_log['calibrated_prob_vectors'])
         if num_calibrated_rounds >= config['start_round']:
-            prompt_probs = prior_conversation_log['calibrated_prob_vectors'][config['start_round']]
+            prompt_probs = prior_conversation_log['calibrated_prob_vectors'][config['start_round'] - 1]
         else:
             # Need to compute calibrated probs for the last round in prior log
             prev_round = config['start_round'] - 1
             if config.get('calibrator_models') is not None and prev_round in config['calibrator_models']:
                 # Get raw probs from prior log
                 current_raw = prior_conversation_log['prob_vectors'][-1]  # p_{r-1} raw
+                print(colored(f"Base probs from round {prev_round}: {current_raw}", 'light_cyan'))
                 # Get the probs from the round before that (calibrated if available, else raw)
                 if len(prior_conversation_log['prob_vectors']) >= 2:
-                    if len(prior_conversation_log['calibrated_prob_vectors']) >= 2 and prior_conversation_log['calibrated_prob_vectors'][-2] is not None:
-                        prev_prev = prior_conversation_log['calibrated_prob_vectors'][-2]
+                    if len(prior_conversation_log['calibrated_prob_vectors']) >= 2 and prior_conversation_log['calibrated_prob_vectors'][-1] is not None:
+                        prev_prev = prior_conversation_log['calibrated_prob_vectors'][-1]
+                        print(colored(f"Calibrated probs from round {prev_round - 1}: {prev_prev}", 'light_cyan'))
                     else:
                         prev_prev = prior_conversation_log['prob_vectors'][-2]
+                        print(colored(f"Base probs from round {prev_round - 1}: {prev_prev}", 'light_cyan'))
                     # Apply calibrator for prev_round to get calibrated probs
                     prompt_probs = calibrate_probabilities(
                         config['calibrator_models'][prev_round], current_raw, prev_prev
@@ -189,6 +196,7 @@ def api_converse(config, client, starting_prompts, prior_conversation_log=None):
                     diff = round(1.00 - sum(prompt_probs), 2)
                     largest_idx = np.argmax(prompt_probs)
                     prompt_probs[largest_idx] = prompt_probs[largest_idx] + diff
+                    prompt_probs = [round(p, 2) for p in prompt_probs]
                     print(colored(f"Applied calibrator_round{prev_round} to get calibrated probs: {prompt_probs}", 'light_cyan'))
                     # Save the computed calibrated probs back to conversation_log
                     conversation_log['calibrated_prob_vectors'].append(prompt_probs)
@@ -196,6 +204,8 @@ def api_converse(config, client, starting_prompts, prior_conversation_log=None):
                     prompt_probs = current_raw
             else:
                 prompt_probs = prior_conversation_log['prob_vectors'][-1]
+                print(colored(f"Base probs from round {prev_round}: {prompt_probs}", 'light_cyan'))
+                conversation_log['calibrated_prob_vectors'].append(None)
         
         prompt = f"The other agent answered with probabilities for [d,r,u,l]: {prompt_probs}."
         # Initialize prev_prob_vector from the (calibrated) probs so calibration is applied on first round
@@ -207,9 +217,15 @@ def api_converse(config, client, starting_prompts, prior_conversation_log=None):
         agent.round = r
         prompt = starting_prompts[agent_id] + prompt
         print(colored(f"PROMPT: {prompt}", 'light_blue'))
-        full_response, final_answer, prob_vector, format_failure = agent.generate_response(prompt)
-
         
+        format_failure = True
+        num_attempts = 5
+        while format_failure and num_attempts > 0:
+            full_response, final_answer, prob_vector, format_failure = agent.generate_response(prompt)
+            num_attempts -= 1
+        
+        if format_failure:
+            raise ValueError(f"Format failure after {5} attempts")
         
         if prob_vector is not None:
             rounded_prob_vector = [round(p, 2) for p in prob_vector]
@@ -366,7 +382,7 @@ if __name__ == "__main__":
     calibrator_models = None
     if args.calibrator_path:
         calibrator_models = {}
-        for r in range(1, args.start_round): # no calibrator for round 0
+        for r in range(args.start_round-1, args.start_round): # no calibrator for round 0
             calibrator_model, _, calibrator_round = load_calibrator(os.path.join(args.calibrator_path, f"calibrator_round{r}.pt"))
             print(f"Loaded calibrator from {os.path.join(args.calibrator_path, f'calibrator_round{r}.pt')} (trained on round {calibrator_round})")
             calibrator_models[r] = calibrator_model
@@ -404,8 +420,14 @@ if __name__ == "__main__":
     success_count = 0
     format_failure_count = 0
 
-    conversations_dir = os.path.join(config["out_dir"], "conversations")
+    conversations_dir = os.path.join(config["out_dir"], f"conversations{config['start_round']}")
     os.makedirs(conversations_dir, exist_ok=True)
+
+    if config['start_round'] > 0:
+        conversations_dir_prior = os.path.join(config["out_dir"], f"conversations{config['start_round'] - 1}")
+        print(f"Path to saved conversations from prior rounds: {conversations_dir_prior}")
+    else:
+        conversations_dir_prior = None
 
     maze_conversation_logs = {i: [] for i in range(start_maze, end_maze)} # save conversation logs for each maze
     if config["solo"]:
@@ -472,6 +494,7 @@ if __name__ == "__main__":
         with open(input_file0, "r") as f0, open(input_file1, "r") as f1:
             input_lines0 = f0.readlines()
             input_lines1 = f1.readlines()
+        success = True
         for i, (input_line0, input_line1) in tqdm(enumerate(zip(input_lines0[start_maze:end_maze], input_lines1[start_maze:end_maze]), start=start_maze)):
             print(colored(f"Maze line {i}: ======================================================", 'light_magenta'))
             maze_str0 = input_line0.split('=')[0].strip()
@@ -483,11 +506,10 @@ if __name__ == "__main__":
             # label_sequence = "rrrrrddlddrd"
 
             if start_round > 0: # get conversation logs for this maze with data from previous rounds
-                prior_conversation_logs = np.load(os.path.join(conversations_dir, f"maze_{i}.npy"), allow_pickle=True).item()
+                prior_conversation_logs = np.load(os.path.join(conversations_dir_prior, f"maze_{i}.npy"), allow_pickle=True).item()
 
             prefix = ""
             # autoregessively generate the path
-            wrong_move = False
             for j in range(len(label_sequence)):
             # for i in range(3):
                 print(colored(f"MOVE {j+1}: ======================================================", 'light_green'))
@@ -510,28 +532,37 @@ if __name__ == "__main__":
                 if format_failure:
                     print("Response failed")
                     format_failure_count += 1
-                    break
+                    success = False
+                    prefix += label_sequence[j]
+                    print(f"Updated prefix after move {j+1} with correct move: {prefix}")
+                    continue
                 
                 final_answer = conversation_log['final_answers'][-1]
-                prefix += final_answer[0].lower()
-
+                
                 # move onto next maze if the final answer is wrong
                 if final_answer[0].lower() != label_sequence[j]:
-                    print(f"Wrong move! The generated path {prefix} does not match the label sequence {label_sequence}.")
-                    wrong_move = True
-                    break
+                    print(f"Wrong move! The generated path {prefix+final_answer[0].lower()} does not match the label sequence {label_sequence}.")
+                    success = False
+                    prefix += label_sequence[j]
+                    print(f"Updated prefix after move {j+1} with correct move: {prefix}")
+                    continue
+
+                prefix += final_answer[0].lower()
                 print(f"Updated prefix after move {j+1}: {prefix}")
             
             # save conversation log for this maze
             np.save(os.path.join(conversations_dir, f"maze_{i}.npy"), {i: maze_conversation_logs[i]})
 
-            if format_failure or wrong_move:
-                continue
+            # if format_failure or wrong_move:
+                # continue
 
-            print(f"Final generated path: {prefix}")
-            print(f"Label sequence: {label_sequence}")
-            success_count += 1
-            print("Success! The generated path matches the label sequence.")
+            if success:
+                success_count += 1
+                print("Success! The generated path matches the label sequence.")
+            else:
+                print("Failure! The generated path does not match the label sequence.")
+            # print(f"Final generated path: {prefix}")
+            # print(f"Label sequence: {label_sequence}")
 
         _tee.force_print(f"Success rate: {success_count} / {num_mazes}")
         _tee.force_print(f"Format failure rate: {format_failure_count} / {num_mazes}")
