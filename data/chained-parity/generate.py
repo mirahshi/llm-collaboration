@@ -90,25 +90,20 @@ def generate_chained_parity(num_examples, num_bits, alphas=None, out_dir="data/c
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate chained parity examples")
-    parser.add_argument("--num_examples", type=int, default=10000)
-    parser.add_argument("--num_bits", type=int, default=10)
-    parser.add_argument("--out_dir", type=str, default="data/chained-parity")
-    parser.add_argument("--seed", type=int, default=None)
-    args = parser.parse_args()
+    num_examples = 3000000
+    num_bits = 30
 
     # alphas = [0.45 / args.num_bits for _ in range(args.num_bits)] # default: uniform alphas
     # custom decreasing sequence of alphas that sum to 0.49
-    alphas = [0.15, 0.10, 0.10, 0.05]
-    alphas.extend([(0.49 - sum(alphas))/(args.num_bits - len(alphas)) for _ in range(args.num_bits - len(alphas))])
-    assert sum(alphas) < 0.5 and len(alphas) == args.num_bits
+    # alphas = [0.15, 0.10, 0.10, 0.05]
+    alphas = [0.48, 0.00001, 0.00001, 0.00001]
+    alphas.extend([(0.49 - sum(alphas))/(num_bits - len(alphas)) for _ in range(num_bits - len(alphas))])
+    assert sum(alphas) < 0.5 and len(alphas) == num_bits
 
     generate_chained_parity(
-        num_examples=args.num_examples,
-        num_bits=args.num_bits,
-        alphas=alphas,
-        out_dir=args.out_dir,
-        seed=args.seed,
+        num_examples=num_examples,
+        num_bits=num_bits,
+        alphas=alphas
     )
 
-    print(f"Generated {args.num_examples} examples of {args.num_bits} bits in {args.out_dir}")
+    print(f"Generated {num_examples} examples of {num_bits} bits")
