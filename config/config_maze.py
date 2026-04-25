@@ -42,6 +42,7 @@ m_lookahead = 1 # number of autoregressive lookahead predictions to generate in 
 autoregressive_lookahead = True # use autoregressive lookahead (otherwise, use ground truth targets)
 
 prune_dataset = False # prune the dataset after each round to remove examples that are correct with 100% confidence
+use_curriculum = False # train using curriculum (requires prune_dataset=True)
 
 # we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False

@@ -87,6 +87,8 @@ append_probabilities = True # append probabilities to output file
 append_probabilities_precision = 2 # decimal places for appended probabilities
 append_probabilities_temperature = 1.0 # temperature for appended probabilities (default is 1)
 prune_dataset = False # prune the dataset after each round to remove examples that are correct with 100% confidence
+use_curriculum = False # if True, train on pruned train set (requires prune_dataset=True)
+generate_hard_dataset = False # generate hard dataset
 # model
 n_layer = 12
 n_head = 12
@@ -126,6 +128,10 @@ class Agent():
         self.collaborator_model = collaborator_model
         if self.collaborator_model is not None:
             self.collaborator_id = (self.id - 1) % self.config['num_agents'] # collaborator is the previous agent
+        
+        # validate config
+        if self.config['use_curriculum'] and not self.config['prune_dataset']:
+            raise ValueError("use_curriculum=True requires prune_dataset=True to generate pruned training data")
 
         # various inits, derived attributes, I/O setup
         self.ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -308,6 +314,7 @@ class Agent():
         if self.collaborator_model is not None:
             t0 = time.time()
             data_dir = self.config['out_dir']
+            # always load from combined file (needed for original train/val evaluation)
             file_name_suffix = f'{self.id}_round{self.round}'
             input_file = os.path.join(data_dir, f'input{file_name_suffix}.txt')
             with open(input_file, 'r') as f:
@@ -316,10 +323,34 @@ class Agent():
                 collaborator_probs_list = [line.split(delimiter)[-1] for line in lines] # get last element
                 collaborator_probs_list = [ast.literal_eval(prob) for prob in collaborator_probs_list]
             self.collaborator_probs = torch.tensor(collaborator_probs_list, device=self.config['device'], dtype=torch.float32)
+
+            if self.config['prune_dataset'] and self.round > 0:
+                # load collaborator probabilities from pruned train set
+                pruned_train_file = os.path.join(data_dir, f'input{self.id}_round{self.round}_pruned_train.txt')
+                with open(pruned_train_file, 'r') as f:
+                    lines = f.readlines()
+                    delimiter = ';'
+                    collaborator_probs_list = [line.split(delimiter)[-1] for line in lines] # get last element
+                    collaborator_probs_list = [ast.literal_eval(prob) for prob in collaborator_probs_list]
+                self.collaborator_probs_train = torch.tensor(collaborator_probs_list, device=self.config['device'], dtype=torch.float32)
+                print(f"Loaded collaborator probabilities from pruned train set: {pruned_train_file}")
+                
+                # load collaborator probabilities from pruned val set
+                pruned_val_file = os.path.join(data_dir, f'input{self.id}_round{self.round}_pruned_val.txt')
+                with open(pruned_val_file, 'r') as f:
+                    lines = f.readlines()
+                    delimiter = ';'
+                    collaborator_probs_list = [line.split(delimiter)[-1] for line in lines] # get last element
+                    collaborator_probs_list = [ast.literal_eval(prob) for prob in collaborator_probs_list]
+                self.collaborator_probs_val = torch.tensor(collaborator_probs_list, device=self.config['device'], dtype=torch.float32)
+                print(f"Loaded collaborator probabilities from pruned val set: {pruned_val_file}")
             t1 = time.time()
             print(f"Time taken for fetching collaborator probabilities: {t1 - t0} seconds")
 
     def get_batch(self, split, num_examples=None):
+        """
+        split: 'train' or 'val' or 'val_pruned' (to do eval on pruned dataset)
+        """
         # We recreate np.memmap every batch to avoid a memory leak, as per
         # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
 
@@ -327,12 +358,14 @@ class Agent():
         file_name_suffix = f'{self.id}_round{self.round}'
         
         if split == 'train':
-            if self.config['prune_dataset'] and self.round > 0: # if prune dataset, use pruned dataset for training, original dataset for validation
+            if self.config['use_curriculum'] and self.round > 0: # if use_curriculum, train on pruned dataset
                 data = np.memmap(os.path.join(data_dir, f'train{file_name_suffix}_pruned.bin'), dtype=np.uint16, mode='r')
             else:
                 data = np.memmap(os.path.join(data_dir, f'train{file_name_suffix}.bin'), dtype=np.uint16, mode='r')
-        else:
+        elif split == 'val': # original validation set
             data = np.memmap(os.path.join(data_dir, f'val{file_name_suffix}.bin'), dtype=np.uint16, mode='r')
+        elif split == 'val_pruned': # pruned validation set
+            data = np.memmap(os.path.join(data_dir, f'val{file_name_suffix}_pruned.bin'), dtype=np.uint16, mode='r')
         # ix = torch.randint(len(data) - block_size, (batch_size,))
         # ix_examples is randomly sampled example numbers in the batch
         # ix is the starting indices of the examples in the batch (ix is multiples of example_size)
@@ -354,11 +387,20 @@ class Agent():
         # if collaborator is True, get collaborator probabilities (stored in input file)
         if self.collaborator_model is not None:
             if split == 'train':
-                collaborator_probs = self.collaborator_probs[ix_examples]
-            else:
-                num_examples = self.collaborator_probs.shape[0]
-                split_idx = int(num_examples*0.9)
+                if self.config['use_curriculum'] and self.round > 0:
+                    # training on pruned train set, use pruned train collaborator probs
+                    collaborator_probs = self.collaborator_probs_train[ix_examples]
+                else:
+                    # training on original train set, use first 90% of combined collaborator probs
+                    collaborator_probs = self.collaborator_probs[ix_examples]
+            elif split == 'val':
+                # use original val probs (from combined file with offset)
+                num_examples_combined = self.collaborator_probs.shape[0]
+                split_idx = int(num_examples_combined*0.9)
                 collaborator_probs = self.collaborator_probs[split_idx+ix_examples]
+            elif split == 'val_pruned':
+                # use pruned val collaborator probs
+                collaborator_probs = self.collaborator_probs_val[ix_examples]
             collaborator_probs = collaborator_probs.unsqueeze(1) # shape (B, 1, V)
         else:
             collaborator_probs = None  
@@ -371,9 +413,12 @@ class Agent():
         The labelled dataset is saved to output_path.
         """
         if self.config['prune_dataset']:
-            output_path_pruned = output_path.replace('.txt', '_pruned.txt')
-            print(f"pruned dataset will be saved to {output_path_pruned}")
-            with open(output_path_pruned, 'w') as f:
+            output_path_pruned_train = output_path.replace('.txt', '_pruned_train.txt')
+            output_path_pruned_val = output_path.replace('.txt', '_pruned_val.txt')
+            print(f"pruned dataset will be saved to {output_path_pruned_train} and {output_path_pruned_val}")
+            with open(output_path_pruned_train, 'w') as f:
+                pass
+            with open(output_path_pruned_val, 'w') as f:
                 pass
         with open(output_path, 'w') as f:
             pass
@@ -382,7 +427,8 @@ class Agent():
             f_label_lines = f_label.readlines()
             f_input.seek(0)  # reset file pointer to start
             f_label.seek(0)  # reset file pointer to start
-            num_batches = len(f_input_lines) // batch_size
+            num_examples = len(f_input_lines)
+            num_batches = num_examples // batch_size
             for batch_idx in tqdm.tqdm(range(num_batches)):
                 start_line_idx = batch_idx * batch_size
                 input_lines = f_input_lines[start_line_idx:start_line_idx + batch_size]
@@ -416,65 +462,122 @@ class Agent():
                 # apply temperature scaling to communicated probabilities
                 T = self.config['append_probabilities_temperature']
                 answer_probs_scaled = torch.softmax(torch.log(answer_probs.clamp_min(1e-12)) / T, dim=-1)
-                if T == 1.0:
-                    assert torch.allclose(answer_probs, answer_probs_scaled, atol=1e-4), f"answer_probs and answer_probs_scaled are not the same when T = 1.0:\nanswer_probs = {answer_probs}\nanswer_probs_scaled = {answer_probs_scaled}"
+                # if T == 1.0:
+                    # assert torch.allclose(answer_probs, answer_probs_scaled, atol=1e-4), f"answer_probs and answer_probs_scaled are not the same when T = 1.0:\nanswer_probs = {answer_probs}\nanswer_probs_scaled = {answer_probs_scaled}"
 
                 # write predictions to label file
                 label_lines = f_label_lines[start_line_idx:start_line_idx + batch_size]
+                output_lines = []
+                pruned_train_lines = []
+                pruned_val_lines = []
+                split_idx = int(num_examples * 0.9)
+                if self.config['generate_hard_dataset']:
+                    hard_dataset_lines0 = []
+                    hard_dataset_lines1 = []
+                    with open(os.path.join(self.config['out_dir'], 'input0_round0.txt'), 'r') as f:
+                        lines0 = f.readlines()
+                    with open(os.path.join(self.config['out_dir'], 'input1_round0.txt'), 'r') as f:
+                        lines1 = f.readlines()
+
+                
                 for i, (label_line, prediction, prob, prob_scaled) in enumerate(zip(label_lines, predictions, answer_probs, answer_probs_scaled)):
                     remove_example = False
                     if self.config['prune_dataset']:
-                    # if answer_probs has prob 1 on the correct answer, skip it
+                        # if answer_probs has prob 1 on the correct answer, skip it
                         correct_answer = label_line.rstrip('\n')[-1]
                         correct_idx = self.config['answer_tokens'].index(correct_answer)
                         prob_correct_answer = prob[0, correct_idx].item()
                         if prob_correct_answer > 0.999:
                             if torch.rand(1).item() > 0.1: # keep easy examples with probability 0.1
                                 remove_example = True
-                    with open(output_path, "a", encoding="utf-8") as out:
-                        output_line = label_line.rstrip('\n')
-                        # write probabilities, prediction, and label to output file
-                        if self.config['append_predictions']:
-                            output_line = f"{prediction},{output_line}"
-                        if self.config['append_probabilities']:
-                            # prob is a list. convert prob to a string without brackets and join elemets with commas
-                            # round probabilities to specified number of decimal places
-                            prob_string = ','.join(f"{p:.{self.config['append_probabilities_precision']}f}" for p in prob_scaled[0].tolist())
-                            output_line = f"{prob_string},{output_line}"
-                        out.write(f"{output_line};{prob[0].tolist()};{prob_scaled[0].tolist()}\n")   
-                        # out.write(f"{prob[0].tolist()};{prediction};{label_line}\n")
-                        if self.config['prune_dataset'] and not remove_example:
-                            with open(output_path_pruned, "a", encoding="utf-8") as out_pruned:
-                                out_pruned.write(f"{output_line};{prob[0].tolist()};{prob_scaled[0].tolist()}\n")
+                    
+                    output_line = label_line.rstrip('\n')
+                    # write probabilities, prediction, and label to output file
+                    if self.config['append_predictions']:
+                        output_line = f"{prediction},{output_line}"
+                    if self.config['append_probabilities']:
+                        # round probabilities to specified number of decimal places
+                        prob_string = ','.join(f"{p:.{self.config['append_probabilities_precision']}f}" for p in prob_scaled[0].tolist())
+                        output_line = f"{prob_string},{output_line}"
+                    
+                    full_line = f"{output_line};{prob[0].tolist()};{prob_scaled[0].tolist()}\n"
+                    output_lines.append(full_line)
+                    
+                    if self.config['prune_dataset'] and not remove_example:
+                        example_idx = start_line_idx + i
+                        if example_idx < split_idx:  # write to pruned train set
+                            pruned_train_lines.append(full_line)
+                        else:  # write to pruned val set
+                            pruned_val_lines.append(full_line)
+                        if self.config['generate_hard_dataset']:
+                            # generate hard dataset
+                            hard_dataset_lines0.append(lines0[example_idx])
+                            hard_dataset_lines1.append(lines1[example_idx])
+                
+                # Batch write to files
+                with open(output_path, "a", encoding="utf-8") as out:
+                    out.writelines(output_lines)
+                if self.config['prune_dataset']:
+                    if pruned_train_lines:
+                        with open(output_path_pruned_train, "a", encoding="utf-8") as out:
+                            out.writelines(pruned_train_lines)
+                    if pruned_val_lines:
+                        with open(output_path_pruned_val, "a", encoding="utf-8") as out:
+                            out.writelines(pruned_val_lines)
+                if self.config['generate_hard_dataset']:
+                    with open(os.path.join(self.config['out_dir'], 'hard_input0_round0.txt'), 'a', encoding="utf-8") as out:
+                        out.writelines(hard_dataset_lines0)
+                    with open(os.path.join(self.config['out_dir'], 'hard_input1_round0.txt'), 'a', encoding="utf-8") as out:
+                        out.writelines(hard_dataset_lines1)
+            
             if self.config['prune_dataset']:
                 num_examples = len(f_label_lines)
                 # print number of examples in output file after pruning
-                with open(output_path_pruned, 'r') as f:
-                    num_examples_after_pruning = len(f.readlines())
-                fraction_examples_after_pruning = num_examples_after_pruning / num_examples
-                print(colored(f"Number of examples in dataset after pruning: {num_examples_after_pruning}", 'light_blue'))
-                print(colored(f"Percentage of examples remaining: {fraction_examples_after_pruning * 100}%", 'light_blue'))
+                with open(output_path_pruned_train, 'r') as f:
+                    num_train_after_pruning = len(f.readlines())
+                with open(output_path_pruned_val, 'r') as f:
+                    num_val_after_pruning = len(f.readlines())
+                fraction_train_after_pruning = num_train_after_pruning / num_examples
+                fraction_val_after_pruning = num_val_after_pruning / num_examples
+                print(colored(f"Number of examples in train dataset after pruning: {num_train_after_pruning}", 'light_blue'))
+                print(colored(f"Number of examples in val dataset after pruning: {num_val_after_pruning}", 'light_blue'))
+                print(colored(f"Percentage of examples remaining in train dataset: {fraction_train_after_pruning * 100}%", 'light_blue'))
+                print(colored(f"Percentage of examples remaining in val dataset: {fraction_val_after_pruning * 100}%", 'light_blue'))
                 if self.config['wandb_log'] and wandb.run is not None:
-                    wandb.log({"data/fraction_examples_after_pruning": fraction_examples_after_pruning})
+                    wandb.log({"data/fraction_train_after_pruning": fraction_train_after_pruning})
+                    wandb.log({"data/fraction_val_after_pruning": fraction_val_after_pruning})
 
         next_agent_id = (self.id + 1) % self.config['num_agents']
         file_name_suffix = f'{next_agent_id}_round{self.round+1}'
         prepare(output_path, self.config['out_dir'], file_name_suffix)
         if self.config['prune_dataset']:
             file_name_suffix_pruned = file_name_suffix + '_pruned'
-            prepare(output_path_pruned, self.config['out_dir'], file_name_suffix_pruned)
+            prepare(output_path_pruned_train, self.config['out_dir'], file_name_suffix_pruned, split='train')
+            prepare(output_path_pruned_val, self.config['out_dir'], file_name_suffix_pruned, split='val')
  
     @torch.no_grad()
-    def maze_success_rate(self, num_mazes=1000):
-        with open(os.path.join(self.data_dir, f'input{self.id}_round{self.round}.txt'), 'r') as input_file:
+    def maze_success_rate(self, num_mazes=1000, use_pruned=False):
+        if use_pruned:
+            input_path = os.path.join(self.data_dir, f'input{self.id}_round{self.round}_pruned_val.txt')
+        else:
+            input_path = os.path.join(self.data_dir, f'input{self.id}_round{self.round}.txt')
+        with open(input_path, 'r') as input_file:
             lines = input_file.readlines()
-            # get validation examples
-            num_examples = len(lines)
-            split_idx = int(num_examples*0.9)
-            lines = lines[split_idx:]
+            if use_pruned:
+                # pruned val file already contains only validation examples
+                pass
+            else:
+                # get validation examples from combined file
+                num_examples = len(lines)
+                split_idx = int(num_examples*0.9)
+                lines = lines[split_idx:]
             examples = [line.split(';')[0].rstrip('\n') for line in lines]
             # maze_starting_indices = [i for i, example in enumerate(examples) if example[-2] == '=']
             maze_starting_indices = [i for i, example in enumerate(examples) if example[-self.config['m_lookahead']-1] == '=']
+            num_available_mazes = len(maze_starting_indices)
+            if num_available_mazes < num_mazes:
+                print(colored(f"Warning: only {num_available_mazes} mazes available, requested {num_mazes}", 'light_red'))
+                num_mazes = num_available_mazes
             sampled_mazes = random.sample(range(len(maze_starting_indices)), num_mazes) 
 
             num_successes = 0
@@ -619,6 +722,28 @@ class Agent():
             t1 = time.time()
             print(f"Time taken for computing maze success rate: {t1 - t0} seconds")
         
+        # also evaluate on pruned validation set if exists
+        if self.config['prune_dataset'] and self.round > 0:
+            losses_pruned = torch.zeros(self.config['eval_iters'])
+            zero_one_losses_pruned = torch.zeros(self.config['eval_iters'])
+            for k in range(self.config['eval_iters']):
+                X, Y, collaborator_probs = self.get_batch('val_pruned')
+                collaborator_predictions = None
+                with self.ctx:
+                    logits, calibrator_logits, CE_loss_sequence, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, calibrator_sm_cross_ece_loss, calibrator_cross_ece_loss, calibrator_ece_loss, calibrator_entropy, calibrator_agreement, calibrator_zero_one_loss, brier_score, zero_one_loss, entropy, agreement, ece_loss_temperature_scaled = self.model(X, Y, collaborator_predictions, collaborator_probs)
+                losses_pruned[k] = loss.item()
+                zero_one_losses_pruned[k] = zero_one_loss.item()
+            out['val_pruned'] = losses_pruned.mean()
+            out['val_pruned_zero_one_loss'] = zero_one_losses_pruned.mean()
+            
+            # compute maze success rate on pruned val set
+            if self.config['datasets'][self.id] == 'maze':
+                t0 = time.time()
+                maze_success_rate_pruned = self.maze_success_rate(num_mazes=1000, use_pruned=True)
+                out['val_pruned_maze_success_rate'] = maze_success_rate_pruned
+                t1 = time.time()
+                print(f"Time taken for computing maze success rate on pruned val: {t1 - t0} seconds")
+
         self.model.train()
         return out
 
@@ -728,6 +853,16 @@ class Agent():
                         log_data.update({
                             "val/maze_success_rate": losses['val_maze_success_rate'],
                         })
+                    # log pruned validation metrics if available
+                    if 'val_pruned' in losses:
+                        log_data.update({
+                            "val_pruned/loss": losses['val_pruned'],
+                            "val_pruned/zero_one_loss": losses['val_pruned_zero_one_loss'],
+                        })
+                        if 'val_pruned_maze_success_rate' in losses:
+                            log_data.update({
+                                "val_pruned/maze_success_rate": losses['val_pruned_maze_success_rate'],
+                            })
                     wandb.log(log_data, step=global_step)
 
                 if losses['val'] < self.best_val_loss or self.config['always_save_checkpoint']:

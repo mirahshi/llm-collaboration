@@ -7,19 +7,35 @@ input_file1="out-collab_exp17/m1/input1_round0.txt"
 
 prune_dataset=True
 
-# append probabilities
-wandb_run_name="input-probs-curriculum"
+# # curriculum (append probabilities)
+# wandb_run_name="input-probs-curriculum-v2"
+# out_dir="out-${wandb_group_name}/${wandb_run_name}"
+# use_curriculum=True
+# append_probabilities=True
+# append_predictions=False
+# append_argmax_predictions=False
+# start_from_round=1
+# label_starting_round=True
+# mkdir -p ${out_dir}
+# cp -n out-collab_exp21/input-probs/ckpt_round0_agent0.pt ${out_dir}
+# python prepare.py --input_file=${input_file0} --out_dir=${out_dir} --suffix="0_round0"
+# python prepare.py --input_file=${input_file1} --out_dir=${out_dir} --suffix="1_round0"
+# python train_converse.py config/config_maze.py --wandb_group_name=${wandb_group_name} --wandb_run_name=${wandb_run_name} --out_dir=${out_dir} --append_probabilities=${append_probabilities} --append_predictions=${append_predictions} --append_argmax_predictions=${append_argmax_predictions} --start_from_round=${start_from_round} --label_starting_round=${label_starting_round} --prune_dataset=${prune_dataset} --use_curriculum=${use_curriculum}
+
+# no curriculum (append probabilities)
+wandb_run_name="input-probs-no-curriculum-v2"
 out_dir="out-${wandb_group_name}/${wandb_run_name}"
+use_curriculum=False
 append_probabilities=True
 append_predictions=False
 append_argmax_predictions=False
-start_from_round=0
-label_starting_round=False
+start_from_round=1
+label_starting_round=True
 mkdir -p ${out_dir}
-# cp -n out-collab_exp21/input-probs/ckpt_round0_agent0.pt ${out_dir}
+cp -n out-collab_exp21/input-probs/ckpt_round0_agent0.pt ${out_dir}
 python prepare.py --input_file=${input_file0} --out_dir=${out_dir} --suffix="0_round0"
 python prepare.py --input_file=${input_file1} --out_dir=${out_dir} --suffix="1_round0"
-python train_converse.py config/config_maze.py --wandb_group_name=${wandb_group_name} --wandb_run_name=${wandb_run_name} --out_dir=${out_dir} --append_probabilities=${append_probabilities} --append_predictions=${append_predictions} --append_argmax_predictions=${append_argmax_predictions} --start_from_round=${start_from_round} --label_starting_round=${label_starting_round} --prune_dataset=${prune_dataset}
+python train_converse.py config/config_maze.py --wandb_group_name=${wandb_group_name} --wandb_run_name=${wandb_run_name} --out_dir=${out_dir} --append_probabilities=${append_probabilities} --append_predictions=${append_predictions} --append_argmax_predictions=${append_argmax_predictions} --start_from_round=${start_from_round} --label_starting_round=${label_starting_round} --prune_dataset=${prune_dataset} --use_curriculum=${use_curriculum}
 
 # # append argmax action
 # wandb_run_name="input-argmax-actions"

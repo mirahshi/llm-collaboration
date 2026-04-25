@@ -14,7 +14,17 @@ from termcolor import colored
 from config.config_maze import out_dir, datasets
 
 
-def prepare(input_file_path, out_dir, file_name_suffix='', save_original_data=False):
+def prepare(input_file_path, out_dir, file_name_suffix='', save_original_data=False, split='both'):
+    """
+    Prepare the dataset for training and evaluation.
+    Args:
+        input_file_path: path to the input file
+        out_dir: directory to save the output files
+        file_name_suffix: suffix to use for the output files
+        save_original_data: whether to save the original data
+        split: 'both' to create the train and test splits, 'train' to save all data to a single train bin file, 'val' to save all data to a single val bin file
+    """
+
     print(colored(f"input file: {input_file_path}", 'blue'))
     assert os.path.exists(input_file_path), f"input file {input_file_path} does not exist"
 
@@ -43,29 +53,42 @@ def prepare(input_file_path, out_dir, file_name_suffix='', save_original_data=Fa
     def decode(l):
         return ''.join([itos[i] for i in l]) # decoder: take a list of integers, output a string
 
-    # create the train and test splits
-    n_examples = len(processed_lines)
-    split_idx = int(n_examples*0.9)
-    train_lines = processed_lines[:split_idx]
-    val_lines = processed_lines[split_idx:]
-    train_data = ''.join(train_lines)
-    val_data = ''.join(val_lines)
-
-    # encode both to integers
-    train_ids = encode(train_data)
-    val_ids = encode(val_data)
-    print(f"train has {len(train_ids):,} tokens")
-    print(f"val has {len(val_ids):,} tokens")
-
-    # export to bin files
-    train_ids = np.array(train_ids, dtype=np.uint16)
-    val_ids = np.array(val_ids, dtype=np.uint16)
-
     os.makedirs(out_dir, exist_ok=True)
 
-    train_ids.tofile(os.path.join(out_dir, f'train{file_name_suffix}.bin'))
-    val_ids.tofile(os.path.join(out_dir, f'val{file_name_suffix}.bin'))
-    print(colored(f"saved train and val datasets to {os.path.join(out_dir, f'train{file_name_suffix}.bin')} and {os.path.join(out_dir, f'val{file_name_suffix}.bin')}", 'light_blue'))
+    n_examples = len(processed_lines)
+    if split == 'both': # create the train and test splits
+        split_idx = int(n_examples*0.9)
+        train_lines = processed_lines[:split_idx]
+        val_lines = processed_lines[split_idx:]
+        train_data = ''.join(train_lines)
+        val_data = ''.join(val_lines)
+
+        # encode both to integers
+        train_ids = encode(train_data)
+        val_ids = encode(val_data)
+        print(f"train has {len(train_ids):,} tokens")
+        print(f"val has {len(val_ids):,} tokens")
+
+        # export to bin files
+        train_ids = np.array(train_ids, dtype=np.uint16)
+        val_ids = np.array(val_ids, dtype=np.uint16)
+
+        train_ids.tofile(os.path.join(out_dir, f'train{file_name_suffix}.bin'))
+        val_ids.tofile(os.path.join(out_dir, f'val{file_name_suffix}.bin'))
+        print(colored(f"saved train and val datasets to {os.path.join(out_dir, f'train{file_name_suffix}.bin')} and {os.path.join(out_dir, f'val{file_name_suffix}.bin')}", 'light_blue'))
+    else: # no split, save all data to a single bin file
+        data_all = ''.join(processed_lines)
+
+        # encode all data to integers
+        data_all_ids = encode(data_all)
+        print(f"{split} has {len(data_all_ids):,} tokens")
+
+        # export to bin file
+        data_all_ids = np.array(data_all_ids, dtype=np.uint16)
+        data_all_ids.tofile(os.path.join(out_dir, f'{split}{file_name_suffix}.bin'))
+        print(colored(f"saved {split} data to {os.path.join(out_dir, f'{split}{file_name_suffix}.bin')}", 'light_blue'))
+
+
 
     # save the meta information as well, to help us encode/decode later
     meta = {
@@ -73,8 +96,12 @@ def prepare(input_file_path, out_dir, file_name_suffix='', save_original_data=Fa
         'itos': itos,
         'stoi': stoi,
     }
-    with open(os.path.join(out_dir, f'meta{file_name_suffix}.pkl'), 'wb') as f:
-        pickle.dump(meta, f)
+    if split == 'both':
+        with open(os.path.join(out_dir, f'meta{file_name_suffix}.pkl'), 'wb') as f:
+            pickle.dump(meta, f)
+    else:
+        with open(os.path.join(out_dir, f'meta{split}{file_name_suffix}.pkl'), 'wb') as f:
+            pickle.dump(meta, f)
 
     # save input file to out_dir
     if save_original_data:
