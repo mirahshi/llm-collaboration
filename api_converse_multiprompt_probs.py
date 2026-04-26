@@ -19,6 +19,198 @@ from openai import OpenAI
 from calibrator import load_calibrator, calibrate_probabilities
 
 
+# ---------------------------------------------------------------------------
+# HuggingFace client shim – mirrors the subset of the OpenAI client used here
+# ---------------------------------------------------------------------------
+
+class _HFMessage:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class _HFChoice:
+    def __init__(self, content: str):
+        self.message = _HFMessage(content)
+
+
+class _HFResponse:
+    def __init__(self, content: str):
+        self.choices = [_HFChoice(content)]
+
+
+class _HFCompletions:
+    def __init__(self, model, tokenizer, device, is_instruct: bool):
+        self._model = model
+        self._tokenizer = tokenizer
+        self._device = device
+        self._is_instruct = is_instruct
+
+    def create(self, model, messages, max_completion_tokens, temperature, top_p, **kwargs):
+        import torch
+        
+        attention_mask = None
+        
+        if self._is_instruct and hasattr(self._tokenizer, "apply_chat_template"):
+            # Instruct models: use chat template
+            tokenized = self._tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
+            # Newer tokenizers may return BatchEncoding here, not a raw tensor.
+            if hasattr(tokenized, "keys"):
+                input_ids = tokenized["input_ids"]
+                attention_mask = tokenized.get("attention_mask")
+            else:
+                input_ids = tokenized
+            
+            # Stop tokens for instruct models (chat-specific end tokens)
+            stop_token_ids = []
+            if self._tokenizer.eos_token_id is not None:
+                stop_token_ids.append(self._tokenizer.eos_token_id)
+            for stop_str in ["<|im_end|>", "<|end|>", "<|eot_id|>", "<|endoftext|>"]:
+                tok_id = self._tokenizer.convert_tokens_to_ids(stop_str)
+                if tok_id != self._tokenizer.unk_token_id and tok_id not in stop_token_ids:
+                    stop_token_ids.append(tok_id)
+        else:
+            # Base models: use plain text completion (no chat template)
+            text = "\n".join(m["content"] for m in messages)
+            tokenized = self._tokenizer(text, return_tensors="pt")
+            input_ids = tokenized["input_ids"]
+            attention_mask = tokenized.get("attention_mask")
+            
+            # Stop tokens for base models (EOS + double newlines)
+            stop_token_ids = []
+            if self._tokenizer.eos_token_id is not None:
+                stop_token_ids.append(self._tokenizer.eos_token_id)
+            for stop_str in ["\n\n", "\n\n\n"]:
+                tok_ids = self._tokenizer.encode(stop_str, add_special_tokens=False)
+                if tok_ids:
+                    stop_token_ids.append(tok_ids[-1])
+        
+        input_ids = input_ids.to(self._device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self._device)
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        stop_token_ids = [x for x in stop_token_ids if not (x in seen or seen.add(x))]
+        
+        if not stop_token_ids:
+            stop_token_ids = [self._tokenizer.eos_token_id]
+        
+        pad_token_id = (
+            self._tokenizer.pad_token_id
+            if self._tokenizer.pad_token_id is not None
+            else stop_token_ids[0]
+        )
+        generate_kwargs = {
+            "input_ids": input_ids,
+            "max_new_tokens": max_completion_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "do_sample": True,
+            "eos_token_id": stop_token_ids,
+            "pad_token_id": pad_token_id,
+        }
+        if attention_mask is not None:
+            generate_kwargs["attention_mask"] = attention_mask
+
+        with torch.no_grad():
+            output_ids = self._model.generate(**generate_kwargs)
+
+        # Decode only the newly generated tokens (strip the prompt)
+        new_tokens = output_ids[0][input_ids.shape[-1]:]
+        text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
+        
+        # Post-process for base models: truncate at delimiter if present
+        if not self._is_instruct and "~" in text:
+            # Keep up to and including the line with ~
+            lines = text.split("\n")
+            result_lines = []
+            for line in lines:
+                result_lines.append(line)
+                if "~" in line:
+                    break
+            text = "\n".join(result_lines)
+        
+        return _HFResponse(text)
+
+
+class _HFChatNamespace:
+    def __init__(self, completions):
+        self.completions = completions
+
+
+class HuggingFaceClient:
+    """Drop-in replacement for the OpenAI client used in this script."""
+
+    def __init__(self, model_name: str, model_path: str):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        import torch
+
+        # Detect if this is an instruct/chat model based on name
+        model_name_lower = model_name.lower()
+        is_instruct = any(kw in model_name_lower for kw in ["instruct", "chat", "-it"])
+        
+        print(f"Loading HuggingFace model '{model_name}' (cache: {model_path}) …")
+        print(f"  Mode: {'instruct (chat template)' if is_instruct else 'base (text completion)'}")
+        
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            model_name, cache_dir=model_path
+        )
+        # Some models (e.g. Qwen) have no pad token set; fall back to eos.
+        if self._tokenizer.pad_token is None:
+            self._tokenizer.pad_token = self._tokenizer.eos_token
+        self._model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            cache_dir=model_path,
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+        self._device = next(self._model.parameters()).device
+        self.chat = _HFChatNamespace(
+            _HFCompletions(self._model, self._tokenizer, self._device, is_instruct)
+        )
+
+
+class _Tee:
+    """Write to a log file, and optionally also to the original stdout."""
+
+    _ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
+
+    def __init__(self, log_path: str, verbose: bool = True):
+        self._stdout = sys.stdout
+        self._verbose = verbose
+        self._log = open(log_path, "w", buffering=1, encoding="utf-8")
+
+    def write(self, data: str):
+        if self._verbose:
+            self._stdout.write(data)
+        self._log.write(self._ansi_escape.sub("", data))
+
+    def flush(self):
+        self._stdout.flush()
+        self._log.flush()
+
+    def force_print(self, *args, **kwargs):
+        """Always print to terminal and log, regardless of verbose setting."""
+        import io
+        buf = io.StringIO()
+        print(*args, file=buf, **kwargs)
+        text = buf.getvalue()
+        self._stdout.write(text)
+        self._log.write(self._ansi_escape.sub("", text))
+
+    def close(self):
+        sys.stdout = self._stdout
+        self._log.close()
+
+    # Delegate attribute lookups (e.g. `isatty`) to the real stdout.
+    def __getattr__(self, name):
+        return getattr(self._stdout, name)
+
+
 def format_maze(maze_str):
     maze_size = int(len(maze_str) ** 0.5)
     formatted_maze = "\n".join(maze_str[i:i+maze_size] for i in range(0, len(maze_str), maze_size))
@@ -47,33 +239,38 @@ class Agent():
 
         print(colored(f"===== BEGIN K={K} BLOCK =====", 'light_grey'))
         for k in range(K):
-            response = self.client.chat.completions.create(
-                model=self.config['model_name'],
-                messages=[{"role": "user", "content": prompt}],
-                max_completion_tokens=self.config['max_new_tokens'],
-                temperature=self.config['temperature'],
-                top_p=self.config['top_p'],
-            )
-            choice = response.choices[0]
-            text = choice.message.content.strip()
-            responses.append(text)
+            valid_response = False
+            num_attempts = 5
+            while not valid_response and num_attempts > 0:
+                response = self.client.chat.completions.create(
+                    model=self.config['model_name'],
+                    messages=[{"role": "user", "content": prompt}],
+                    max_completion_tokens=self.config['max_new_tokens'],
+                    temperature=self.config['temperature'],
+                    top_p=self.config['top_p'],
+                )
+                choice = response.choices[0]
+                text = choice.message.content.strip()
+                responses.append(text)
 
-            # parse the final answer after the delimiter
-            answer = None
-            parts = text.split(delimiter)
-            if len(parts) >= 2:
-                answer = parts[-1].strip().lower()
-                if len(answer) > 0:
-                    answer = answer[0]
-                if answer in target_tokens:
-                    counts[target_tokens.index(answer)] += 1
-                    valid_count += 1
-                else:
-                    answer = None
+                # parse the final answer after the delimiter
+                answer = None
+                parts = text.split(delimiter)
+                if len(parts) >= 2:
+                    answer = parts[-1].strip().lower()
+                    if len(answer) > 0:
+                        answer = answer[0]
+                    if answer in target_tokens:
+                        counts[target_tokens.index(answer)] += 1
+                        valid_count += 1
+                        valid_response = True
+                    else:
+                        answer = None
+                        num_attempts -= 1
 
-            print(colored(f"--- sample {k+1}/{K} ---", 'light_grey'))
-            print(text)
-            print(colored(f"    answer: {answer}", 'light_cyan'))
+                print(colored(f"--- sample {k+1}/{K} ---", 'light_grey'))
+                print(text)
+                print(colored(f"    answer: {answer}", 'light_cyan'))
 
         # build concatenated full_response with markers
         full_response_parts = [f"===== BEGIN K={K} BLOCK ====="]
@@ -238,7 +435,11 @@ def str2bool(v):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Collaborative maze conversation using ChatGPT API")
+    parser = argparse.ArgumentParser(description="Collaborative maze conversation using OpenAI or HuggingFace API")
+    parser.add_argument("--api", type=str, default="openai", choices=["openai", "huggingface"],
+                        help="Backend API to use: 'openai' (default) or 'huggingface'")
+    parser.add_argument("--model_path", type=str, default=None,
+                        help="Local cache directory for HuggingFace models (only used when --api huggingface)")
     parser.add_argument("--model_name", type=str, default="gpt-4.1-mini",
                         help="Model to use for the conversation")
     parser.add_argument("--max_new_tokens", type=int, default=2048,
@@ -270,10 +471,17 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    
-    # load API key
-    api_key = Path("gpt_api_key.txt").read_text().strip()
-    client = OpenAI(api_key=api_key)
+
+    # build client based on selected backend
+    if args.api == "huggingface":
+        if args.model_path is None:
+            raise ValueError("--model_path must be specified when using --api huggingface")
+        client = HuggingFaceClient(model_name=args.model_name, model_path=args.model_path)
+        print(f"Loaded HuggingFace client for model {args.model_name}")
+    else:
+        api_key = Path("gpt_api_key.txt").read_text().strip()
+        client = OpenAI(api_key=api_key)
+        print(f"Loaded OpenAI client for model {args.model_name}")
 
     # Load calibrators if specified
     calibrator_models = None
@@ -296,6 +504,9 @@ if __name__ == "__main__":
         "calibrator_models": calibrator_models,
         "data_dir": args.data_dir,
         "out_dir": args.out_dir,
+        "verbose": args.verbose,
+        "api": args.api,
+        "model_path": args.model_path,
     }
     start_maze = args.start_maze
     end_maze = args.end_maze
