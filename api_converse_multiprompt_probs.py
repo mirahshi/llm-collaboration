@@ -21,6 +21,88 @@ from openai import OpenAI
 from calibrator import load_calibrator, calibrate_probabilities
 
 
+# ---------------------------------------------------------------------------
+# HuggingFace client shim – mirrors the subset of the OpenAI client used here
+# ---------------------------------------------------------------------------
+
+class _HFMessage:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class _HFChoice:
+    def __init__(self, content: str):
+        self.message = _HFMessage(content)
+
+
+class _HFResponse:
+    def __init__(self, content: str):
+        self.choices = [_HFChoice(content)]
+
+
+class _HFCompletions:
+    def __init__(self, model, tokenizer, device):
+        self._model = model
+        self._tokenizer = tokenizer
+        self._device = device
+
+    def create(self, model, messages, max_completion_tokens, temperature, top_p, **kwargs):
+        # Format messages using the tokenizer's chat template when available,
+        # otherwise fall back to a simple concatenation.
+        if hasattr(self._tokenizer, "apply_chat_template"):
+            input_ids = self._tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            ).to(self._device)
+        else:
+            text = "\n".join(m["content"] for m in messages)
+            input_ids = self._tokenizer(text, return_tensors="pt").input_ids.to(self._device)
+
+        import torch
+        with torch.no_grad():
+            output_ids = self._model.generate(
+                input_ids,
+                max_new_tokens=max_completion_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=True,
+            )
+
+        # Decode only the newly generated tokens (strip the prompt)
+        new_tokens = output_ids[0][input_ids.shape[-1]:]
+        text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
+        return _HFResponse(text)
+
+
+class _HFChatNamespace:
+    def __init__(self, completions):
+        self.completions = completions
+
+
+class HuggingFaceClient:
+    """Drop-in replacement for the OpenAI client used in this script."""
+
+    def __init__(self, model_name: str, model_path: str):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        import torch
+
+        print(f"Loading HuggingFace model '{model_name}' (cache: {model_path}) …")
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            model_name, cache_dir=model_path
+        )
+        self._model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            cache_dir=model_path,
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+        self._device = next(self._model.parameters()).device
+        self.chat = _HFChatNamespace(
+            _HFCompletions(self._model, self._tokenizer, self._device)
+        )
+
+
 class _Tee:
     """Write to a log file, and optionally also to the original stdout."""
 
@@ -277,7 +359,11 @@ def str2bool(v):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Collaborative maze conversation using ChatGPT API")
+    parser = argparse.ArgumentParser(description="Collaborative maze conversation using OpenAI or HuggingFace API")
+    parser.add_argument("--api", type=str, default="openai", choices=["openai", "huggingface"],
+                        help="Backend API to use: 'openai' (default) or 'huggingface'")
+    parser.add_argument("--model_path", type=str, default=None,
+                        help="Local cache directory for HuggingFace models (only used when --api huggingface)")
     parser.add_argument("--model_name", type=str, default="gpt-4.1-mini",
                         help="Model to use for the conversation")
     parser.add_argument("--max_new_tokens", type=int, default=2048,
@@ -311,10 +397,15 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    
-    # load API key
-    api_key = Path("gpt_api_key.txt").read_text().strip()
-    client = OpenAI(api_key=api_key)
+
+    # build client based on selected backend
+    if args.api == "huggingface":
+        if args.model_path is None:
+            raise ValueError("--model_path must be specified when using --api huggingface")
+        client = HuggingFaceClient(model_name=args.model_name, model_path=args.model_path)
+    else:
+        api_key = Path("gpt_api_key.txt").read_text().strip()
+        client = OpenAI(api_key=api_key)
 
     # Load calibrators if specified
     calibrator_models = None
@@ -338,6 +429,8 @@ if __name__ == "__main__":
         "data_dir": args.data_dir,
         "out_dir": args.out_dir,
         "verbose": args.verbose,
+        "api": args.api,
+        "model_path": args.model_path,
     }
     start_maze = args.start_maze
     end_maze = args.end_maze

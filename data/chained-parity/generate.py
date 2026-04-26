@@ -61,10 +61,10 @@ def generate_chained_parity(num_examples, num_bits, alphas=None, out_dir="data/c
             running *= bit
             prefix_products.append(running)
 
-        product_term = 1.0
+        sum_term = 0.0
         for alpha_j, s_j in zip(alphas, prefix_products):
-            product_term *= alpha_j * s_j
-        p_y1 = 0.5 + product_term
+            sum_term += alpha_j * s_j
+        p_y1 = 0.5 + sum_term
 
         y = 1 if random.random() < p_y1 else 0
 
