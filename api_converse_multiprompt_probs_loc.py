@@ -1,0 +1,685 @@
+#!/usr/bin/env python3
+"""
+Collaborative maze conversation script using the ChatGPT API.
+Reads the API key from gpt_api_key.txt, then runs multi-agent rounds.
+
+    python api_converse.py
+"""
+
+from __future__ import annotations
+from termcolor import colored
+import argparse
+import os
+import re
+import sys
+from tqdm import tqdm
+
+import numpy as np
+from pathlib import Path
+from openai import OpenAI
+
+from calibrator import load_calibrator, calibrate_probabilities
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace client shim – mirrors the subset of the OpenAI client used here
+# ---------------------------------------------------------------------------
+
+class _HFMessage:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class _HFChoice:
+    def __init__(self, content: str):
+        self.message = _HFMessage(content)
+
+
+class _HFResponse:
+    def __init__(self, contents):
+        if isinstance(contents, str):
+            contents = [contents]
+        self.choices = [_HFChoice(c) for c in contents]
+
+
+class _HFCompletions:
+    def __init__(self, model, tokenizer, device, is_instruct: bool):
+        self._model = model
+        self._tokenizer = tokenizer
+        self._device = device
+        self._is_instruct = is_instruct
+
+    def create(self, model, messages, max_completion_tokens, temperature, top_p, n=1, **kwargs):
+        import torch
+
+        attention_mask = None
+
+        if self._is_instruct and hasattr(self._tokenizer, "apply_chat_template"):
+            # Instruct models: use chat template. return_dict=True so we get a
+            # real attention_mask of all ones — without it, generate() builds
+            # one as (input_ids != pad_token_id), which masks <|im_end|> in the
+            # prompt when pad_token == eos_token and breaks turn boundaries.
+            tokenized = self._tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+                return_dict=True,
+            )
+            input_ids = tokenized["input_ids"]
+            attention_mask = tokenized["attention_mask"]
+
+            # Stop tokens for instruct models (chat-specific end tokens)
+            stop_token_ids = []
+            if self._tokenizer.eos_token_id is not None:
+                stop_token_ids.append(self._tokenizer.eos_token_id)
+            unk_id = self._tokenizer.unk_token_id
+            for stop_str in ["<|im_end|>", "<|end|>", "<|eot_id|>", "<|endoftext|>"]:
+                tok_id = self._tokenizer.convert_tokens_to_ids(stop_str)
+                if tok_id is None or tok_id == unk_id:
+                    continue
+                if tok_id not in stop_token_ids:
+                    stop_token_ids.append(tok_id)
+        else:
+            # Base models: use plain text completion (no chat template)
+            text = "\n".join(m["content"] for m in messages)
+            tokenized = self._tokenizer(text, return_tensors="pt")
+            input_ids = tokenized["input_ids"]
+            attention_mask = tokenized.get("attention_mask")
+            
+            # Stop tokens for base models (EOS + double newlines)
+            stop_token_ids = []
+            if self._tokenizer.eos_token_id is not None:
+                stop_token_ids.append(self._tokenizer.eos_token_id)
+            for stop_str in ["\n\n", "\n\n\n"]:
+                tok_ids = self._tokenizer.encode(stop_str, add_special_tokens=False)
+                if tok_ids:
+                    stop_token_ids.append(tok_ids[-1])
+        
+        input_ids = input_ids.to(self._device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self._device)
+
+        # Tile to batch size n so a single generate() call yields n independent
+        # samples (each batch row samples independently under do_sample=True).
+        if n > 1:
+            input_ids = input_ids.expand(n, -1).contiguous()
+            if attention_mask is not None:
+                attention_mask = attention_mask.expand(n, -1).contiguous()
+
+        # Remove duplicates while preserving order
+        seen = set()
+        stop_token_ids = [x for x in stop_token_ids if not (x in seen or seen.add(x))]
+
+        if not stop_token_ids:
+            stop_token_ids = [self._tokenizer.eos_token_id]
+
+        # Pick a pad id that is NOT an EOS — otherwise the auto-built attention
+        # mask masks EOS tokens (e.g. <|im_end|>) inside the prompt.
+        pad_token_id = self._tokenizer.pad_token_id
+        if pad_token_id is None or pad_token_id in stop_token_ids:
+            pad_token_id = 0
+        generate_kwargs = {
+            "input_ids": input_ids,
+            "max_new_tokens": max_completion_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "do_sample": True,
+            "repetition_penalty": 1.05,
+            "eos_token_id": stop_token_ids,
+            "pad_token_id": pad_token_id,
+        }
+        if attention_mask is not None:
+            generate_kwargs["attention_mask"] = attention_mask
+
+        with torch.no_grad():
+            output_ids = self._model.generate(**generate_kwargs)
+
+        # Decode only the newly generated tokens (strip the prompt) for each row
+        prompt_len = input_ids.shape[-1]
+        contents = []
+        for row in output_ids:
+            new_tokens = row[prompt_len:]
+            text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+            # Post-process for base models: truncate at delimiter if present
+            if not self._is_instruct and "~" in text:
+                lines = text.split("\n")
+                result_lines = []
+                for line in lines:
+                    result_lines.append(line)
+                    if "~" in line:
+                        break
+                text = "\n".join(result_lines)
+
+            contents.append(text)
+
+        return _HFResponse(contents)
+
+
+class _HFChatNamespace:
+    def __init__(self, completions):
+        self.completions = completions
+
+
+class HuggingFaceClient:
+    """Drop-in replacement for the OpenAI client used in this script."""
+
+    def __init__(self, model_name: str, model_path: str):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        import torch
+
+        # Detect if this is an instruct/chat model based on name
+        model_name_lower = model_name.lower()
+        is_instruct = any(kw in model_name_lower for kw in ["instruct", "chat", "-it"])
+        
+        print(f"Loading HuggingFace model '{model_name}' (cache: {model_path}) …")
+        print(f"  Mode: {'instruct (chat template)' if is_instruct else 'base (text completion)'}")
+        
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            model_name, cache_dir=model_path
+        )
+        # Do NOT set pad_token = eos_token: that makes generate()'s auto
+        # attention mask hide every <|im_end|> in the prompt and breaks chat.
+        self._model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            cache_dir=model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+        self._device = next(self._model.parameters()).device
+        self.chat = _HFChatNamespace(
+            _HFCompletions(self._model, self._tokenizer, self._device, is_instruct)
+        )
+
+
+class _Tee:
+    """Write to a log file, and optionally also to the original stdout."""
+
+    _ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
+
+    def __init__(self, log_path: str, verbose: bool = True):
+        self._stdout = sys.stdout
+        self._verbose = verbose
+        self._log = open(log_path, "w", buffering=1, encoding="utf-8")
+
+    def write(self, data: str):
+        if self._verbose:
+            self._stdout.write(data)
+        self._log.write(self._ansi_escape.sub("", data))
+
+    def flush(self):
+        self._stdout.flush()
+        self._log.flush()
+
+    def force_print(self, *args, **kwargs):
+        """Always print to terminal and log, regardless of verbose setting."""
+        import io
+        buf = io.StringIO()
+        print(*args, file=buf, **kwargs)
+        text = buf.getvalue()
+        self._stdout.write(text)
+        self._log.write(self._ansi_escape.sub("", text))
+
+    def close(self):
+        sys.stdout = self._stdout
+        self._log.close()
+
+    # Delegate attribute lookups (e.g. `isatty`) to the real stdout.
+    def __getattr__(self, name):
+        return getattr(self._stdout, name)
+
+
+def format_maze(maze_str):
+    maze_size = int(len(maze_str) ** 0.5)
+    formatted_maze = "\n".join(maze_str[i:i+maze_size] for i in range(0, len(maze_str), maze_size))
+    return formatted_maze
+
+
+class Agent():
+    def __init__(self, config, round, id, client):
+        self.config = config
+        self.round = round
+        self.id = id
+        self.client = client
+
+    def generate_response(self, prompt, delimiter='~'):
+        """
+        Returns: full response, final answer, probability vector, format failure.
+        Runs the prompt K times, computes empirical probabilities over d/r/u/l,
+        and samples the final answer from a multinomial over those probabilities.
+        format_failure is True only if ALL K responses failed to produce a valid answer.
+        """
+        K = self.config['num_samples']
+        target_tokens = ['d', 'r', 'u', 'l']
+        counts = np.zeros(4)  # d, r, u, l
+        responses = [""] * K
+        answers = [None] * K
+        attempts_used = [0] * K
+        valid_count = 0
+
+        answer_re = re.compile(re.escape(delimiter) + r'\s*([drul])', re.IGNORECASE)
+        print(colored(f"===== BEGIN K={K} BLOCK =====", 'light_grey'))
+
+        # Run all K samples in one batched call; retry only the slots whose
+        # output failed the answer-format check, up to 5 attempts per slot.
+        remaining = list(range(K))
+        for attempt in range(5):
+            if not remaining:
+                break
+            print(colored(f"attempt {attempt+1} for {len(remaining)} sample(s)", 'light_grey'))
+            response = self.client.chat.completions.create(
+                model=self.config['model_name'],
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=self.config['max_new_tokens'],
+                temperature=self.config['temperature'],
+                top_p=self.config['top_p'],
+                n=len(remaining),
+            )
+            next_remaining = []
+            for i, idx in enumerate(remaining):
+                text = response.choices[i].message.content.strip()
+                responses[idx] = text
+                attempts_used[idx] = attempt + 1
+                m = answer_re.search(text)
+                if m:
+                    answers[idx] = m.group(1).lower()
+                    counts[target_tokens.index(answers[idx])] += 1
+                    valid_count += 1
+                else:
+                    next_remaining.append(idx)
+            remaining = next_remaining
+
+        for k in range(K):
+            print(colored(f"--- sample {k+1}/{K} ---", 'light_grey'))
+            print(responses[k])
+            print(colored(f"    answer: {answers[k]}", 'light_cyan'))
+            print(colored(f"took {attempts_used[k]} attempts" if answers[k] else "failed to get a valid answer after 5 attempts", 'light_red'))
+
+            
+
+        # build concatenated full_response with markers
+        full_response_parts = [f"===== BEGIN K={K} BLOCK ====="]
+        for k, text in enumerate(responses):
+            full_response_parts.append(f"--- sample {k+1}/{K} ---")
+            full_response_parts.append(text)
+            full_response_parts.append(f"--- end sample {k+1}/{K} ---")
+        full_response_parts.append(f"===== END K={K} BLOCK =====")
+        full_response = "\n".join(full_response_parts)
+        print(colored(f"===== END K={K} BLOCK =====", 'light_grey'))
+
+        # determine format failure, prob vector, and final answer
+        if valid_count == 0:
+            format_failure = True
+            prob_vector = None
+            final_answer = None
+            print(colored(f"Warning: All {K} samples failed to produce a valid answer", 'light_red'))
+        else:
+            format_failure = False
+            prob_vector = (counts / valid_count).tolist()
+            # sample final answer from multinomial over empirical probabilities
+            final_answer = np.random.choice(target_tokens, p=prob_vector)
+
+        return full_response, final_answer, prob_vector, format_failure
+
+
+def api_converse(config, client, starting_prompts):
+    # initialize agents
+    agents = {
+        agent_id: Agent(config, 0, agent_id, client)
+        for agent_id in range(config['num_agents'])
+    }
+
+    # save per-round responses
+    conversation_log = {
+        'full_responses': [],
+        'final_answers': [],
+        'prob_vectors': [],
+        'calibrated_prob_vectors': [],
+        'format_failures': [],
+    }
+
+    # conversation loop
+    prompt = ""
+    prev_prob_vector = None
+    for r in range(config['num_rounds']):
+        print(colored(f"ROUND {r}: =================================================", 'light_yellow'))
+        agent_id = r % config['num_agents']  # determine which agent acts this round
+        agent = agents[agent_id]
+        agent.round = r
+        prompt = starting_prompts[agent_id] + prompt
+        print(colored(f"PROMPT: {prompt}", 'light_blue'))
+        full_response, final_answer, prob_vector, format_failure = agent.generate_response(prompt)
+
+        
+        
+        if prob_vector is not None:
+            rounded_prob_vector = [round(p, 2) for p in prob_vector]
+            # renormalize to sum to 1
+            diff = round(1.00 - sum(rounded_prob_vector), 2)
+            largest_element_idx = np.argmax(rounded_prob_vector)
+            rounded_prob_vector[largest_element_idx] = rounded_prob_vector[largest_element_idx] + diff
+            renormalized_prob_vector = [round(p, 2) for p in rounded_prob_vector]
+        else:
+            renormalized_prob_vector = None
+        print(colored(f"Final answer: {final_answer}", 'light_green'))
+        print(colored(f"Probabilities for [d,r,u,l]: {renormalized_prob_vector}", 'light_magenta'))
+
+        # Apply calibration if we have a calibrator and previous round probabilities
+        calibrated_prob_vector = None
+        if config.get('calibrator_models') is not None and prob_vector is not None and prev_prob_vector is not None:
+            calibrated_prob_vector = calibrate_probabilities(
+                config['calibrator_models'][r], renormalized_prob_vector, prev_prob_vector
+            )
+            rounded_calibrated_prob_vector = [round(p, 2) for p in calibrated_prob_vector]
+            # renormalize to sum to 1
+            diff = round(1.00 - sum(rounded_calibrated_prob_vector), 2)
+            largest_element_idx = np.argmax(rounded_calibrated_prob_vector)
+            rounded_calibrated_prob_vector[largest_element_idx] = rounded_calibrated_prob_vector[largest_element_idx] + diff
+            renormalized_calibrated_prob_vector = [round(p, 2) for p in rounded_calibrated_prob_vector]
+            print(colored(f"Calibrated probabilities for [d,r,u,l]: {renormalized_calibrated_prob_vector}", 'light_cyan'))
+        else:
+            renormalized_calibrated_prob_vector = None
+        
+        # save responses for this round
+        conversation_log['full_responses'].append(full_response)
+        conversation_log['final_answers'].append(final_answer)
+        conversation_log['prob_vectors'].append(renormalized_prob_vector)
+        conversation_log['calibrated_prob_vectors'].append(renormalized_calibrated_prob_vector)
+        conversation_log['format_failures'].append(format_failure)
+
+        # stop the conversation if there is a format failure
+        if format_failure:
+            break
+
+        # update prompt for next round
+        # Use calibrated probabilities if available, otherwise use raw probabilities
+        probs_for_prompt = renormalized_calibrated_prob_vector if renormalized_calibrated_prob_vector is not None else renormalized_prob_vector
+
+        prompt = f"The other agent answered with probabilities for [d,r,u,l]: {probs_for_prompt}."
+
+        # Track previous round's probabilities for calibration
+        prev_prob_vector = probs_for_prompt
+
+    return conversation_log
+
+def generate_starting_prompt(config, maze_str, prefix="", solo=False):
+    formatted_maze = format_maze(maze_str)
+    if not solo: # generate collaborative starting prompt
+        return_string = f"""Task: You are going to play the collaborative maze game together with another agent. The maze consists of a grid with walls and a goal. Your task is to jointly determine the next move on the path. You and the other agent will take that action together. You will each get your own map of the same maze, with some coordinates hidden. Because of the hidden coordinates, you will need to communicate with the other agent to share information about the maze and coordinate your next move. Both agents together have enough information to solve the maze, so you do not need to explore.
+Rules:
+- You can only move to adjacent cells [down(d), right(r), up(u), left(l)].
+- You can not move diagonally or through walls.
+- Once you make an incorrect move, you lose. 
+Here is **your** map of the maze with a legend of the symbols: 
+{formatted_maze} 
+Legend:
+@ - Current Position
+* - Goal Position
+. - Path
+# - Wall
+? - Hidden Cell
+"""
+    else: # generate solo starting prompt
+        return_string = f"""Task: You are going to play a maze game. The maze consists of a grid with walls and a goal. Your task is to navigate through the maze, avoiding walls, to reach the goal.
+Rules:
+- You can only move to adjacent cells [down(d), right(r), up(u), left(l)].
+- You can not move diagonally or through walls.
+- Once you make an incorrect move, you lose. 
+Here is the map of the maze with a legend of the symbols: 
+{formatted_maze} 
+Legend:
+@ - Current Position
+* - Goal Position
+. - Path
+# - Wall
+"""
+
+    if prefix != "": # add path prefix if it exists
+        return_string += f"""
+This is the path to the goal that you have moved so far: {prefix}
+"""
+    return_string += """
+Explain your reasoning, then you must answer with one of d, r, u, l. Put your final answer after the delimiter ~. For example, if your final answer is d, your response should contain ~d. 
+"""
+    return_string += """
+Your moves are timed for speed so hurry up! 
+"""
+    return return_string
+
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected (true/false, yes/no, 1/0)')
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Collaborative maze conversation using OpenAI or HuggingFace API")
+    parser.add_argument("--api", type=str, default="openai", choices=["openai", "huggingface"],
+                        help="Backend API to use: 'openai' (default) or 'huggingface'")
+    parser.add_argument("--model_path", type=str, default=None,
+                        help="Local cache directory for HuggingFace models (only used when --api huggingface)")
+    parser.add_argument("--model_name", type=str, default="gpt-4.1-mini",
+                        help="Model to use for the conversation")
+    parser.add_argument("--max_new_tokens", type=int, default=2048,
+                        help="Max tokens for response (allow for reasoning before final answer)")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Sampling temperature")
+    parser.add_argument("--top_p", type=float, default=0.9,
+                        help="Top-p sampling parameter")
+    parser.add_argument("--num_rounds", type=int, default=4,
+                        help="Number of conversation rounds between agents")
+    parser.add_argument("--num_agents", type=int, default=2,
+                        help="Number of agents")
+    parser.add_argument("--solo", type=str2bool, default=False,
+                        help="Run solo full info baseline instead of collaborative game")
+    parser.add_argument("--num_samples", type=int, default=10,
+                        help="Number of times (K) to run each prompt for empirical probability estimation")
+    parser.add_argument("--calibrator_path", type=str, default=None,
+                        help="Path to directory containing trained calibrator models (e.g., calibrator_plots/)")
+    parser.add_argument("--data_dir", type=str, default="out-api_exp1",
+                        help="Directory containing input data")
+    parser.add_argument("--out_dir", type=str, default="out-api_exp1/multiprompt_probs",
+                        help="Directory for output logs")
+    parser.add_argument("--start_maze", type=int, default=0,
+                        help="Index of first maze (inclusive)")
+    parser.add_argument("--end_maze", type=int, default=20,
+                        help="Index of last maze (exclusive)")
+    parser.add_argument("--verbose", type=str2bool, default=True,
+                        help="Print to terminal")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    # build client based on selected backend
+    if args.api == "huggingface":
+        if args.model_path is None:
+            raise ValueError("--model_path must be specified when using --api huggingface")
+        client = HuggingFaceClient(model_name=args.model_name, model_path=args.model_path)
+        print(f"Loaded HuggingFace client for model {args.model_name}")
+    else:
+        api_key = Path("gpt_api_key.txt").read_text().strip()
+        client = OpenAI(api_key=api_key)
+        print(f"Loaded OpenAI client for model {args.model_name}")
+
+    # Load calibrators if specified
+    calibrator_models = None
+    if args.calibrator_path:
+        calibrator_models = {}
+        for r in range(1, args.num_rounds): # no calibrator for round 0
+            calibrator_model, _, calibrator_round = load_calibrator(os.path.join(args.calibrator_path, f"calibrator_round{r}.pt"))
+            print(f"Loaded calibrator from {os.path.join(args.calibrator_path, f'calibrator_round{r}.pt')} (trained on round {calibrator_round})")
+            calibrator_models[r] = calibrator_model
+
+    config = {
+        "model_name": args.model_name,
+        "max_new_tokens": args.max_new_tokens,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "num_rounds": args.num_rounds,
+        "num_agents": args.num_agents,
+        "solo": args.solo,
+        "num_samples": args.num_samples,
+        "calibrator_models": calibrator_models,
+        "data_dir": args.data_dir,
+        "out_dir": args.out_dir,
+        "verbose": args.verbose,
+        "api": args.api,
+        "model_path": args.model_path,
+    }
+    start_maze = args.start_maze
+    end_maze = args.end_maze
+    num_mazes = end_maze - start_maze
+
+    os.makedirs(config["out_dir"], exist_ok=True)
+
+    # run on dataset
+    data_dir = config["data_dir"]
+    # get mazes from data_dir
+    # mazes is a dictionary mapping maze index to maze strings
+    input_mazes0 = {}
+    input_mazes1 = {}
+    with open(os.path.join(data_dir, "input0.txt"), "r") as f0, open(os.path.join(data_dir, "input1.txt"), "r") as f1:
+        input_lines0 = f0.readlines()
+        input_lines1 = f1.readlines()
+        maze_starting_indices = [i for i, example in enumerate(input_lines0) if example[0] == '@']
+        num_mazes = len(maze_starting_indices)
+        for i in range(num_mazes):
+            if i == num_mazes - 1:
+                input_mazes0[i] = [input_lines0[j].strip() for j in range(maze_starting_indices[i], len(input_lines0))]
+                input_mazes1[i] = [input_lines1[j].strip() for j in range(maze_starting_indices[i], len(input_lines1))]
+            else:
+                input_mazes0[i] = [input_lines0[j].strip() for j in range(maze_starting_indices[i], maze_starting_indices[i+1])]
+                input_mazes1[i] = [input_lines1[j].strip() for j in range(maze_starting_indices[i], maze_starting_indices[i+1])]
+    
+    
+    success_count = 0
+    format_failure_count = 0
+
+    conversations_dir = os.path.join(config["out_dir"], "conversations")
+    os.makedirs(conversations_dir, exist_ok=True)
+
+    maze_conversation_logs = {i: [] for i in range(start_maze, end_maze)} # save conversation logs for each maze
+    if config["solo"]:
+        print(colored("Running solo full info baseline", 'light_yellow'))
+        config["num_agents"] = 1
+        config["num_rounds"] = 1
+        input_file = os.path.join(data_dir, "input_full.txt")
+        with open(input_file, "r") as f:
+            input_lines = f.readlines()
+        for i, input_line in tqdm(enumerate(input_lines[start_maze:end_maze], start=start_maze)):
+            print(colored(f"Maze line {i}: ======================================================", 'light_magenta'))
+            maze_str = input_line.split('=')[0].strip()
+            label_sequence = input_line.split('=')[1].strip()
+
+            prefix = ""
+            # autoregessively generate the path
+            wrong_move = False
+            for j in range(len(label_sequence)):
+            # for i in range(3):
+                print(colored(f"MOVE {j+1}: ======================================================", 'light_green'))
+                starting_prompt = generate_starting_prompt(config, maze_str, prefix, solo=True)
+                conversation_log = api_converse(config, client, [starting_prompt])
+
+                # save label to conversation log
+                conversation_log['label'] = label_sequence[j]
+                
+                # save conversation log for this maze
+                maze_conversation_logs[i].append(conversation_log)
+                
+                # move onto next maze if there is a format failure
+                format_failure = conversation_log['format_failures'][-1]
+                if format_failure:
+                    print("Response failed")
+                    format_failure_count += 1
+                    break
+                
+                final_answer = conversation_log['final_answers'][-1]
+                prefix += final_answer[0].lower()
+
+                # move onto next maze if the final answer is wrong
+                if final_answer[0].lower() != label_sequence[j]:
+                    print(f"Wrong move! The generated path {prefix} does not match the label sequence {label_sequence}.")
+                    wrong_move = True
+                    break
+                print(f"Updated prefix after move {j+1}: {prefix}")
+            
+            # save conversation log for this maze
+            np.save(os.path.join(conversations_dir, f"maze_{i}.npy"), {i: maze_conversation_logs[i]})
+
+            if conversation_log['format_failures'][-1] or wrong_move:
+                continue
+
+            print(f"Final generated path: {prefix}")
+            print(f"Label sequence: {label_sequence}")
+            success_count += 1
+            print("Success! The generated path matches the label sequence.")
+
+        print(f"Success rate: {success_count} / {num_mazes}")
+        print(f"Format failure rate: {format_failure_count} / {num_mazes}")
+    else:
+        print(colored("Running collaborative conversation", 'light_yellow'))
+        input_file0 = os.path.join(data_dir, "input0.txt")
+        input_file1 = os.path.join(data_dir, "input1.txt")
+        with open(input_file0, "r") as f0, open(input_file1, "r") as f1:
+            input_lines0 = f0.readlines()
+            input_lines1 = f1.readlines()
+        
+        for i in range(start_maze, end_maze):
+            print(colored(f"Maze {i}: ======================================================", 'light_magenta'))
+            maze_lines0 = input_mazes0[i]
+            maze_lines1 = input_mazes1[i]
+
+            # autoregessively generate the path
+            wrong_move = False
+            for j in range(len(maze_lines0)):
+            # for i in range(3):
+                print(colored(f"MOVE {j+1}: ======================================================", 'light_green'))
+                maze_str0 = maze_lines0[j].split('=')[0].strip()
+                maze_str1 = maze_lines1[j].split('=')[0].strip()
+                label = maze_lines0[j].split('=')[1].strip()
+                correct_prefix = "".join([line.split('=')[1].strip() for line in maze_lines0[0:j]])
+                starting_prompts = [generate_starting_prompt(config, maze_str0, prefix=correct_prefix, solo=False), generate_starting_prompt(config, maze_str1, prefix=correct_prefix, solo=False)]    
+
+                conversation_log = api_converse(config, client, starting_prompts)
+
+                # save label to conversation log
+                conversation_log['label'] = label
+                
+                # save conversation log for this maze
+                maze_conversation_logs[i].append(conversation_log)
+                
+                # move onto next maze if there is a format failure
+                format_failure = conversation_log['format_failures'][-1]
+                if format_failure:
+                    print("Response failed")
+                    format_failure_count += 1
+                    break
+                
+                final_answer = conversation_log['final_answers'][-1]
+
+                # move onto next maze if the final answer is wrong
+                if final_answer[0].lower() != label:
+                    print(f"Wrong move! The generated move {final_answer} does not match the label {label}.")
+                    wrong_move = True
+                    break
+            
+            # save conversation log for this maze
+            np.save(os.path.join(conversations_dir, f"maze_{i}.npy"), {i: maze_conversation_logs[i]})
+
+            if format_failure or wrong_move:
+                continue
+
+            success_count += 1
+            print("Success! The generated path matches the label sequence.")
+
+        print(f"Success rate: {success_count} / {num_mazes}")
+        print(f"Format failure rate: {format_failure_count} / {num_mazes}")
