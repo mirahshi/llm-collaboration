@@ -10,6 +10,8 @@ from __future__ import annotations
 from termcolor import colored
 import argparse
 import os
+import re
+import sys
 from tqdm import tqdm
 
 import numpy as np
@@ -34,8 +36,10 @@ class _HFChoice:
 
 
 class _HFResponse:
-    def __init__(self, content: str):
-        self.choices = [_HFChoice(content)]
+    def __init__(self, contents):
+        if isinstance(contents, str):
+            contents = [contents]
+        self.choices = [_HFChoice(c) for c in contents]
 
 
 class _HFCompletions:
@@ -45,32 +49,35 @@ class _HFCompletions:
         self._device = device
         self._is_instruct = is_instruct
 
-    def create(self, model, messages, max_completion_tokens, temperature, top_p, **kwargs):
+    def create(self, model, messages, max_completion_tokens, temperature, top_p, n=1, **kwargs):
         import torch
-        
+
         attention_mask = None
-        
+
         if self._is_instruct and hasattr(self._tokenizer, "apply_chat_template"):
-            # Instruct models: use chat template
+            # Instruct models: use chat template. return_dict=True so we get a
+            # real attention_mask of all ones — without it, generate() builds
+            # one as (input_ids != pad_token_id), which masks <|im_end|> in the
+            # prompt when pad_token == eos_token and breaks turn boundaries.
             tokenized = self._tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
                 return_tensors="pt",
+                return_dict=True,
             )
-            # Newer tokenizers may return BatchEncoding here, not a raw tensor.
-            if hasattr(tokenized, "keys"):
-                input_ids = tokenized["input_ids"]
-                attention_mask = tokenized.get("attention_mask")
-            else:
-                input_ids = tokenized
-            
+            input_ids = tokenized["input_ids"]
+            attention_mask = tokenized["attention_mask"]
+
             # Stop tokens for instruct models (chat-specific end tokens)
             stop_token_ids = []
             if self._tokenizer.eos_token_id is not None:
                 stop_token_ids.append(self._tokenizer.eos_token_id)
+            unk_id = self._tokenizer.unk_token_id
             for stop_str in ["<|im_end|>", "<|end|>", "<|eot_id|>", "<|endoftext|>"]:
                 tok_id = self._tokenizer.convert_tokens_to_ids(stop_str)
-                if tok_id != self._tokenizer.unk_token_id and tok_id not in stop_token_ids:
+                if tok_id is None or tok_id == unk_id:
+                    continue
+                if tok_id not in stop_token_ids:
                     stop_token_ids.append(tok_id)
         else:
             # Base models: use plain text completion (no chat template)
@@ -91,25 +98,33 @@ class _HFCompletions:
         input_ids = input_ids.to(self._device)
         if attention_mask is not None:
             attention_mask = attention_mask.to(self._device)
-        
+
+        # Tile to batch size n so a single generate() call yields n independent
+        # samples (each batch row samples independently under do_sample=True).
+        if n > 1:
+            input_ids = input_ids.expand(n, -1).contiguous()
+            if attention_mask is not None:
+                attention_mask = attention_mask.expand(n, -1).contiguous()
+
         # Remove duplicates while preserving order
         seen = set()
         stop_token_ids = [x for x in stop_token_ids if not (x in seen or seen.add(x))]
-        
+
         if not stop_token_ids:
             stop_token_ids = [self._tokenizer.eos_token_id]
-        
-        pad_token_id = (
-            self._tokenizer.pad_token_id
-            if self._tokenizer.pad_token_id is not None
-            else stop_token_ids[0]
-        )
+
+        # Pick a pad id that is NOT an EOS — otherwise the auto-built attention
+        # mask masks EOS tokens (e.g. <|im_end|>) inside the prompt.
+        pad_token_id = self._tokenizer.pad_token_id
+        if pad_token_id is None or pad_token_id in stop_token_ids:
+            pad_token_id = 0
         generate_kwargs = {
             "input_ids": input_ids,
             "max_new_tokens": max_completion_tokens,
             "temperature": temperature,
             "top_p": top_p,
             "do_sample": True,
+            "repetition_penalty": 1.05,
             "eos_token_id": stop_token_ids,
             "pad_token_id": pad_token_id,
         }
@@ -119,22 +134,26 @@ class _HFCompletions:
         with torch.no_grad():
             output_ids = self._model.generate(**generate_kwargs)
 
-        # Decode only the newly generated tokens (strip the prompt)
-        new_tokens = output_ids[0][input_ids.shape[-1]:]
-        text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
-        
-        # Post-process for base models: truncate at delimiter if present
-        if not self._is_instruct and "~" in text:
-            # Keep up to and including the line with ~
-            lines = text.split("\n")
-            result_lines = []
-            for line in lines:
-                result_lines.append(line)
-                if "~" in line:
-                    break
-            text = "\n".join(result_lines)
-        
-        return _HFResponse(text)
+        # Decode only the newly generated tokens (strip the prompt) for each row
+        prompt_len = input_ids.shape[-1]
+        contents = []
+        for row in output_ids:
+            new_tokens = row[prompt_len:]
+            text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+            # Post-process for base models: truncate at delimiter if present
+            if not self._is_instruct and "~" in text:
+                lines = text.split("\n")
+                result_lines = []
+                for line in lines:
+                    result_lines.append(line)
+                    if "~" in line:
+                        break
+                text = "\n".join(result_lines)
+
+            contents.append(text)
+
+        return _HFResponse(contents)
 
 
 class _HFChatNamespace:
@@ -159,13 +178,12 @@ class HuggingFaceClient:
         self._tokenizer = AutoTokenizer.from_pretrained(
             model_name, cache_dir=model_path
         )
-        # Some models (e.g. Qwen) have no pad token set; fall back to eos.
-        if self._tokenizer.pad_token is None:
-            self._tokenizer.pad_token = self._tokenizer.eos_token
+        # Do NOT set pad_token = eos_token: that makes generate()'s auto
+        # attention mask hide every <|im_end|> in the prompt and breaks chat.
         self._model = AutoModelForCausalLM.from_pretrained(
             model_name,
             cache_dir=model_path,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
             device_map="auto",
         )
         self._device = next(self._model.parameters()).device
@@ -234,43 +252,50 @@ class Agent():
         K = self.config['num_samples']
         target_tokens = ['d', 'r', 'u', 'l']
         counts = np.zeros(4)  # d, r, u, l
-        responses = []
+        responses = [""] * K
+        answers = [None] * K
+        attempts_used = [0] * K
         valid_count = 0
 
+        answer_re = re.compile(re.escape(delimiter) + r'\s*([drul])', re.IGNORECASE)
         print(colored(f"===== BEGIN K={K} BLOCK =====", 'light_grey'))
+
+        # Run all K samples in one batched call; retry only the slots whose
+        # output failed the answer-format check, up to 5 attempts per slot.
+        remaining = list(range(K))
+        for attempt in range(5):
+            if not remaining:
+                break
+            print(colored(f"attempt {attempt+1} for {len(remaining)} sample(s)", 'light_grey'))
+            response = self.client.chat.completions.create(
+                model=self.config['model_name'],
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=self.config['max_new_tokens'],
+                temperature=self.config['temperature'],
+                top_p=self.config['top_p'],
+                n=len(remaining),
+            )
+            next_remaining = []
+            for i, idx in enumerate(remaining):
+                text = response.choices[i].message.content.strip()
+                responses[idx] = text
+                attempts_used[idx] = attempt + 1
+                m = answer_re.search(text)
+                if m:
+                    answers[idx] = m.group(1).lower()
+                    counts[target_tokens.index(answers[idx])] += 1
+                    valid_count += 1
+                else:
+                    next_remaining.append(idx)
+            remaining = next_remaining
+
         for k in range(K):
-            valid_response = False
-            num_attempts = 5
-            while not valid_response and num_attempts > 0:
-                response = self.client.chat.completions.create(
-                    model=self.config['model_name'],
-                    messages=[{"role": "user", "content": prompt}],
-                    max_completion_tokens=self.config['max_new_tokens'],
-                    temperature=self.config['temperature'],
-                    top_p=self.config['top_p'],
-                )
-                choice = response.choices[0]
-                text = choice.message.content.strip()
-                responses.append(text)
+            print(colored(f"--- sample {k+1}/{K} ---", 'light_grey'))
+            print(responses[k])
+            print(colored(f"    answer: {answers[k]}", 'light_cyan'))
+            print(colored(f"took {attempts_used[k]} attempts" if answers[k] else "failed to get a valid answer after 5 attempts", 'light_red'))
 
-                # parse the final answer after the delimiter
-                answer = None
-                parts = text.split(delimiter)
-                if len(parts) >= 2:
-                    answer = parts[-1].strip().lower()
-                    if len(answer) > 0:
-                        answer = answer[0]
-                    if answer in target_tokens:
-                        counts[target_tokens.index(answer)] += 1
-                        valid_count += 1
-                        valid_response = True
-                    else:
-                        answer = None
-                        num_attempts -= 1
-
-                print(colored(f"--- sample {k+1}/{K} ---", 'light_grey'))
-                print(text)
-                print(colored(f"    answer: {answer}", 'light_cyan'))
+            
 
         # build concatenated full_response with markers
         full_response_parts = [f"===== BEGIN K={K} BLOCK ====="]
@@ -466,6 +491,8 @@ def parse_args():
                         help="Index of first maze (inclusive)")
     parser.add_argument("--end_maze", type=int, default=20,
                         help="Index of last maze (exclusive)")
+    parser.add_argument("--verbose", type=str2bool, default=True,
+                        help="Print to terminal")
     return parser.parse_args()
 
 
