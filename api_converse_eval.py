@@ -38,19 +38,12 @@ def get_maze_conversation_logs_no_format_failures(maze_conversation_logs):
             maze_conversation_logs_no_format_failures[i] = conversation_logs
     return maze_conversation_logs_no_format_failures
 
-def get_label_sequences(input_file):
-    with open(input_file, 'r') as f:
-        lines = f.readlines()
-    label_sequences = [line.split('=')[1].strip() for line in lines]
-    return label_sequences
-
-def measure_zero_one_losses(maze_conversation_logs, label_sequences):
+def measure_zero_one_losses(maze_conversation_logs):
     """
     Compute average 0/1 loss per round.
     
     Args:
         maze_conversation_logs: dict mapping maze index to list of conversation_logs (one per move)
-        label_sequences: list of label sequences (strings), one per maze
     
     Returns:
         dict mapping round number to average 0/1 loss
@@ -64,7 +57,7 @@ def measure_zero_one_losses(maze_conversation_logs, label_sequences):
         for i, conversation_logs in maze_conversation_logs.items():
             for j, conversation_log in enumerate(conversation_logs):
                 final_answer = conversation_log['final_answers'][r]
-                label = label_sequences[i][j]
+                label = conversation_log['label']
                 loss = 0 if final_answer == label else 1
                 round_losses.append(loss)
         losses[r] = np.mean(round_losses)
@@ -100,13 +93,12 @@ def measure_disagreement(maze_conversation_logs):
     return distances
 
 
-def measure_maze_success_rates(maze_conversation_logs, label_sequences):
+def measure_maze_success_rates(maze_conversation_logs):
     """
     Compute maze success rate per round.
     
     Args:
         maze_conversation_logs: dict mapping maze index to list of conversation_logs (one per move)
-        label_sequences: list of label sequences (strings), one per maze
     
     Returns:
         dict mapping round number to maze success rate (fraction of mazes with all moves correct)
@@ -122,7 +114,7 @@ def measure_maze_success_rates(maze_conversation_logs, label_sequences):
             maze_correct = True
             for j, conversation_log in enumerate(conversation_logs):
                 final_answer = conversation_log['final_answers'][r]
-                label = label_sequences[i][j]
+                label = conversation_log['label']
                 if final_answer != label:
                     maze_correct = False
                     break
@@ -156,8 +148,6 @@ if __name__ == "__main__":
         common_maze_indices &= set(all_filtered_logs[run_name].keys())
     print(colored(f"Common mazes with no format failures in all conditions: {len(common_maze_indices)}", 'light_green'))
 
-    label_sequences = get_label_sequences(os.path.join(data_dir, 'input0.txt'))
-
     # Evaluate each condition on the common set of mazes
     for run_name in run_names:
         print(colored(f"\nEvaluating {run_name} (on {len(common_maze_indices)} common mazes)", 'light_yellow'))
@@ -165,8 +155,8 @@ if __name__ == "__main__":
         # Filter to only common mazes
         filtered_logs = {i: all_filtered_logs[run_name][i] for i in common_maze_indices}
         
-        losses = measure_zero_one_losses(filtered_logs, label_sequences)
-        success_rates = measure_maze_success_rates(filtered_logs, label_sequences)
+        losses = measure_zero_one_losses(filtered_logs)
+        success_rates = measure_maze_success_rates(filtered_logs)
         disagreements = measure_disagreement(filtered_logs)
         print(colored("zero-one losses:", 'light_blue'))
         for r, loss in losses.items():
