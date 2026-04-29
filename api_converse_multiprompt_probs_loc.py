@@ -551,9 +551,9 @@ if __name__ == "__main__":
         input_lines0 = f0.readlines()
         input_lines1 = f1.readlines()
         maze_starting_indices = [i for i, example in enumerate(input_lines0) if example[0] == '@']
-        num_mazes = len(maze_starting_indices)
-        for i in range(num_mazes):
-            if i == num_mazes - 1:
+        total_mazes_in_file = len(maze_starting_indices)
+        for i in range(total_mazes_in_file):
+            if i == total_mazes_in_file - 1:
                 input_mazes0[i] = [input_lines0[j].strip() for j in range(maze_starting_indices[i], len(input_lines0))]
                 input_mazes1[i] = [input_lines1[j].strip() for j in range(maze_starting_indices[i], len(input_lines1))]
             else:
@@ -633,15 +633,15 @@ if __name__ == "__main__":
             input_lines0 = f0.readlines()
             input_lines1 = f1.readlines()
         
+        mazes_with_format_failure = 0
         for i in range(start_maze, end_maze):
             print(colored(f"Maze {i}: ======================================================", 'light_magenta'))
             maze_lines0 = input_mazes0[i]
             maze_lines1 = input_mazes1[i]
 
-            # autoregessively generate the path
-            wrong_move = False
+            # track success for this maze
+            success = True
             for j in range(len(maze_lines0)):
-            # for i in range(3):
                 print(colored(f"MOVE {j+1}: ======================================================", 'light_green'))
                 maze_str0 = maze_lines0[j].split('=')[0].strip()
                 maze_str1 = maze_lines1[j].split('=')[0].strip()
@@ -657,29 +657,33 @@ if __name__ == "__main__":
                 # save conversation log for this maze
                 maze_conversation_logs[i].append(conversation_log)
                 
-                # move onto next maze if there is a format failure
+                # track last round format failure - continue to next move
                 format_failure = conversation_log['format_failures'][-1]
                 if format_failure:
-                    print("Response failed")
-                    format_failure_count += 1
-                    break
+                    print("Final response failed")
+                    maze_had_format_failure = True
+                    success = False
+                    continue
                 
                 final_answer = conversation_log['final_answers'][-1]
 
-                # move onto next maze if the final answer is wrong
+                # track last round wrong move - continue to next move
                 if final_answer[0].lower() != label:
                     print(f"Wrong move! The generated move {final_answer} does not match the label {label}.")
-                    wrong_move = True
-                    break
+                    success = False
+                    continue
             
             # save conversation log for this maze
             np.save(os.path.join(conversations_dir, f"maze_{i}.npy"), {i: maze_conversation_logs[i]})
 
-            if format_failure or wrong_move:
-                continue
+            if maze_had_format_failure:
+                mazes_with_format_failure += 1
 
-            success_count += 1
-            print("Success! The generated path matches the label sequence.")
+            if success:
+                success_count += 1
+                print("Success! The generated path matches the label sequence.")
+            else:
+                print("Failure! The generated path does not match the label sequence.")
 
         print(f"Success rate: {success_count} / {num_mazes}")
-        print(f"Format failure rate: {format_failure_count} / {num_mazes}")
+        print(f"Format failure rate: {mazes_with_format_failure} / {num_mazes}")
