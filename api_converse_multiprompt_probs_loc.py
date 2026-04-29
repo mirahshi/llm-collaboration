@@ -493,6 +493,8 @@ def parse_args():
                         help="Index of last maze (exclusive)")
     parser.add_argument("--verbose", type=str2bool, default=True,
                         help="Print to terminal")
+    parser.add_argument("--hard_input_data_dir", type=str, default=None,
+                        help="If specified, use hard input data")                 
     return parser.parse_args()
 
 
@@ -534,6 +536,7 @@ if __name__ == "__main__":
         "verbose": args.verbose,
         "api": args.api,
         "model_path": args.model_path,
+        "hard_input_data_dir": args.hard_input_data_dir,
     }
     start_maze = args.start_maze
     end_maze = args.end_maze
@@ -543,6 +546,7 @@ if __name__ == "__main__":
 
     # run on dataset
     data_dir = config["data_dir"]
+    hard_data_dir = config["hard_input_data_dir"]
     # get mazes from data_dir
     # mazes is a dictionary mapping maze index to maze strings
     input_mazes0 = {}
@@ -550,15 +554,22 @@ if __name__ == "__main__":
     with open(os.path.join(data_dir, "input0.txt"), "r") as f0, open(os.path.join(data_dir, "input1.txt"), "r") as f1:
         input_lines0 = f0.readlines()
         input_lines1 = f1.readlines()
-        maze_starting_indices = [i for i, example in enumerate(input_lines0) if example[0] == '@']
-        maze_starting_indices = maze_starting_indices[start_maze:end_maze+1] 
-        num_mazes_retrieved = len(maze_starting_indices) - 1 # -1 because we don't want to include the last maze starting index
-        print(f"Number of mazes retrieved: {num_mazes_retrieved}")
-        print(f"Maze starting indices: {maze_starting_indices}")
-        for i in range(num_mazes_retrieved):
-            input_mazes0[i] = [input_lines0[j].strip() for j in range(maze_starting_indices[i], maze_starting_indices[i+1])]
-            input_mazes1[i] = [input_lines1[j].strip() for j in range(maze_starting_indices[i], maze_starting_indices[i+1])]
-    
+    if hard_data_dir is not None:
+        with open(os.path.join(hard_data_dir, "hard_input0.txt"), "r") as f0, open(os.path.join(hard_data_dir, "hard_input1.txt"), "r") as f1:
+            hard_input_lines0 = f0.readlines()
+            hard_input_lines1 = f1.readlines()
+    maze_starting_indices = [i for i, example in enumerate(input_lines0) if example[0] == '@']
+    maze_starting_indices = maze_starting_indices[start_maze:end_maze+1] 
+    num_mazes_retrieved = len(maze_starting_indices) - 1 # -1 because we don't want to include the last maze starting index
+    print(f"Number of mazes retrieved: {num_mazes_retrieved}")
+    for i, maze_index in enumerate(range(start_maze, end_maze)):
+        if hard_data_dir is not None: # only include input lines that are in the hard dataset
+            input_mazes0[maze_index] = [input_lines0[j].strip() for j in range(maze_starting_indices[i], maze_starting_indices[i+1]) if input_lines0[j] in hard_input_lines0]
+            input_mazes1[maze_index] = [input_lines1[j].strip() for j in range(maze_starting_indices[i], maze_starting_indices[i+1]) if input_lines1[j] in hard_input_lines1]
+        else:
+            input_mazes0[maze_index] = [input_lines0[j].strip() for j in range(maze_starting_indices[i], maze_starting_indices[i+1])]
+            input_mazes1[maze_index] = [input_lines1[j].strip() for j in range(maze_starting_indices[i], maze_starting_indices[i+1])]
+    print(f"Total number of input lines: {sum([len(input_mazes0[maze_idx]) for maze_idx in range(start_maze, end_maze)])}")
     
     success_count = 0
     format_failure_count = 0
@@ -673,8 +684,9 @@ if __name__ == "__main__":
                     success = False
                     continue
             
-            # save conversation log for this maze
-            np.save(os.path.join(conversations_dir, f"maze_{i}.npy"), {i: maze_conversation_logs[i]})
+            # save conversation log for this maze if there are any conversation logs
+            if len(maze_conversation_logs[i]) > 0:
+                np.save(os.path.join(conversations_dir, f"maze_{i}.npy"), {i: maze_conversation_logs[i]})
 
             if maze_had_format_failure:
                 mazes_with_format_failure += 1
