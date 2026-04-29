@@ -551,14 +551,13 @@ if __name__ == "__main__":
         input_lines0 = f0.readlines()
         input_lines1 = f1.readlines()
         maze_starting_indices = [i for i, example in enumerate(input_lines0) if example[0] == '@']
-        total_mazes_in_file = len(maze_starting_indices)
-        for i in range(total_mazes_in_file):
-            if i == total_mazes_in_file - 1:
-                input_mazes0[i] = [input_lines0[j].strip() for j in range(maze_starting_indices[i], len(input_lines0))]
-                input_mazes1[i] = [input_lines1[j].strip() for j in range(maze_starting_indices[i], len(input_lines1))]
-            else:
-                input_mazes0[i] = [input_lines0[j].strip() for j in range(maze_starting_indices[i], maze_starting_indices[i+1])]
-                input_mazes1[i] = [input_lines1[j].strip() for j in range(maze_starting_indices[i], maze_starting_indices[i+1])]
+        maze_starting_indices = maze_starting_indices[start_maze:end_maze+1] 
+        num_mazes_retrieved = len(maze_starting_indices) - 1 # -1 because we don't want to include the last maze starting index
+        print(f"Number of mazes retrieved: {num_mazes_retrieved}")
+        print(f"Maze starting indices: {maze_starting_indices}")
+        for i in range(num_mazes_retrieved):
+            input_mazes0[i] = [input_lines0[j].strip() for j in range(maze_starting_indices[i], maze_starting_indices[i+1])]
+            input_mazes1[i] = [input_lines1[j].strip() for j in range(maze_starting_indices[i], maze_starting_indices[i+1])]
     
     
     success_count = 0
@@ -641,6 +640,7 @@ if __name__ == "__main__":
 
             # track success for this maze
             success = True
+            maze_had_format_failure = False
             for j in range(len(maze_lines0)):
                 print(colored(f"MOVE {j+1}: ======================================================", 'light_green'))
                 maze_str0 = maze_lines0[j].split('=')[0].strip()
