@@ -152,6 +152,8 @@ class GPTConfig:
     append_probabilities_temperature: float = 1.0 # temperature for appended probabilities (default is 1; here it is used for logging ECE loss on scaled probabilities)
     post_hoc_calibrate: bool = False # post-hoc calibrate the model using the predictions of the previous round
     post_hoc_calibrate_multiplier: float = 1.0 # multiplier for post-hoc cross calibration loss
+    post_hoc_calibrate_use_smECE: bool = True # use sm cross ece loss for post-hoc calibration; if False, use CE loss
+    post_hoc_calibrate_use_smECE_bins: int = 4 # number of bins for sm cross ece loss
     m_lookahead: int = 1 # number of autoregressive lookahead predictions to generate
     autoregressive_lookahead: bool = True # use autoregressive lookahead (otherwise, use ground truth targets)
     answer_tokens: list = field(default_factory=lambda: [''])
@@ -722,16 +724,25 @@ class GPT(nn.Module):
                     # feed own probabilities and collaborator probabilities to CalibrateMLP to get conversation calibrated probabilities
                     calibrator_logits = self.calibrate_mlp(answer_probs, collaborator_probs)
                     calibrator_probs = F.softmax(calibrator_logits, dim=-1)
-                    calibrator_sm_cross_ece_loss = self.ECE_multidim_new(calibrator_probs, labels, K=self.config.K, K_cross=self.config.K_cross, smooth=True, sigma=0.1, collaborator_probs=collaborator_probs, confidence=self.config.confidence)
 
-                    loss = loss + calibrator_sm_cross_ece_loss * self.config.post_hoc_calibrate_multiplier
+                    targets_answer_idx = labels.int().argmax(dim=-1) # (B, T) index of correct answer token
+
+                    if self.config.post_hoc_calibrate_use_smECE:
+                        calibrator_sm_cross_ece_loss = self.ECE_multidim_new(calibrator_probs, labels, K=self.config.post_hoc_calibrate_use_smECE_bins, K_cross=self.config.post_hoc_calibrate_use_smECE_bins, smooth=True, sigma=0.1, collaborator_probs=collaborator_probs, confidence=self.config.confidence)
+                        loss = loss + calibrator_sm_cross_ece_loss * self.config.post_hoc_calibrate_multiplier
+                    else:
+                        # use CE loss for post-hoc calibration
+                        D_answer = calibrator_logits.size(-1)
+                        loss = loss + F.cross_entropy(calibrator_logits.reshape(-1, D_answer), targets_answer_idx.reshape(-1)) * self.config.post_hoc_calibrate_multiplier
 
                     with torch.no_grad():
+                        if not self.config.post_hoc_calibrate_use_smECE:
+                            # still report smECE for monitoring even when not used in the loss
+                            calibrator_sm_cross_ece_loss = self.ECE_multidim_new(calibrator_probs, labels, K=self.config.post_hoc_calibrate_use_smECE_bins, K_cross=self.config.post_hoc_calibrate_use_smECE_bins, smooth=True, sigma=0.1, collaborator_probs=collaborator_probs, confidence=self.config.confidence)
                         calibrator_cross_ece_loss = self.ECE_multidim_new(calibrator_probs, labels, K=self.config.K, K_cross=self.config.K_cross, smooth=False, sigma=0.1, collaborator_probs=collaborator_probs, confidence=self.config.confidence)
                         calibrator_ece_loss = self.ECE_multidim_new(calibrator_probs, labels, K=self.config.K, K_cross=self.config.K_cross, smooth=False, sigma=0.1, confidence=self.config.confidence)
                         calibrator_entropy = self.entropy(calibrator_logits)
                         calibrator_agreement = self.agreement(calibrator_probs, collaborator_probs)
-                        targets_answer_idx = labels.int().argmax(dim=-1)
                         calibrator_zero_one_loss = self.zero_one_loss(calibrator_logits, targets_answer_idx)
                 else:
                     calibrator_logits = None

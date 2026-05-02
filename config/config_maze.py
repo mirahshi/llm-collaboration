@@ -17,6 +17,8 @@ eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 10 # don't print too too often
 
+seed = 0
+
 # calibrate?
 calibrate = None # self-calibrate: None, 'smECE', 'brier'
 multiplier = 1 # multiplier for calibration loss
@@ -30,6 +32,8 @@ compute_smooth_calibration = False # compute smooth calibration losses (memory i
 
 post_hoc_calibrate = False # post-hoc cross calibrate the model using the predictions of the previous round
 post_hoc_calibrate_multiplier = 1.0 # multiplier for post-hoc cross calibration loss
+post_hoc_calibrate_use_smECE = True # use sm cross ece loss for post-hoc calibration; if False, use CE loss
+post_hoc_calibrate_use_smECE_bins = 4 # number of bins for sm cross ece loss
 
 answer_tokens = ['d', 'r', 'u', 'l'] # possible answer tokens
 append_predictions = False # append predictions to output file (default is sampled predictions unless append_argmax_predictions is True)
@@ -101,7 +105,7 @@ dropout = 0.0 # 0.2
 causal = True
 
 learning_rate = 1e-4 # 1e-3 # with baby networks can afford to go a bit higher
-max_iters = 25000
+max_iters = 50000
 lr_decay_iters = max_iters # make equal to max_iters usually
 min_lr = learning_rate / 10 # learning_rate / 10 usually
 beta2 = 0.99 # make a bit bigger because number of tokens per iter is small

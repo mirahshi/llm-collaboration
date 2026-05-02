@@ -66,6 +66,7 @@ block_size = 1024
 # prefix length to ignore in loss (overridden by config files like config/train_arithmetic.py)
 prefix_size = 0
 example_size = 0
+seed = 0
 # calibrate?
 calibrate = 'smECE' # self-calibrate: None, 'smECE', 'brier'
 multiplier = 1 # multiplier for calibration loss
@@ -78,6 +79,8 @@ K_cross = 5 # number of buckets for cross ECE
 compute_smooth_calibration = False # compute smooth calibration losses (memory intensive)
 post_hoc_calibrate = False # post-hoc cross calibrate the model using the predictions of the previous round
 post_hoc_calibrate_multiplier = 1.0 # multiplier for post-hoc cross calibration loss
+post_hoc_calibrate_use_smECE = True # use sm cross ece loss for post-hoc calibration; if False, use CE loss
+post_hoc_calibrate_use_smECE_bins = 4 # number of bins for sm cross ece loss
 m_lookahead = 1 # number of autoregressive lookahead predictions to generate
 autoregressive_lookahead = True # use autoregressive lookahead (otherwise, use ground truth targets)
 answer_tokens = ['0', '1'] # possible answer tokens
@@ -121,7 +124,8 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 class Agent():
-    def __init__(self, config, round, id, collaborator_model=None):
+    def __init__(self, config, round, id, collaborator_model=None, seed=0):
+        self.seed = seed
         self.config = config
         self.id = id
         self.round = round
@@ -158,7 +162,7 @@ class Agent():
 
         if self.master_process:
             os.makedirs(self.config['out_dir'], exist_ok=True)
-        torch.manual_seed(1337 + seed_offset)
+        torch.manual_seed(self.seed + seed_offset)
         torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
         torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
         device_type = 'cuda' if 'cuda' in self.config['device'] else 'cpu' # for later use in torch.autocast
@@ -229,7 +233,7 @@ class Agent():
                         cross_calibrate=self.config['cross_calibrate'], cross_multiplier=self.config['cross_multiplier'], confidence=self.config['confidence'], causal=self.config['causal'], cross_probabilities=self.config['cross_probabilities'], 
                         K=self.config['K'], K_cross=self.config['K_cross'], compute_smooth_calibration=self.config['compute_smooth_calibration'], m_lookahead=self.config['m_lookahead'], 
                         autoregressive_lookahead=self.config['autoregressive_lookahead'], answer_tokens=self.config['answer_tokens'], append_probabilities_temperature=self.config['append_probabilities_temperature'],
-                        post_hoc_calibrate=self.config['post_hoc_calibrate'], post_hoc_calibrate_multiplier=self.config['post_hoc_calibrate_multiplier']) # start with model_args from command line
+                        post_hoc_calibrate=self.config['post_hoc_calibrate'], post_hoc_calibrate_multiplier=self.config['post_hoc_calibrate_multiplier'], post_hoc_calibrate_use_smECE=self.config['post_hoc_calibrate_use_smECE'], post_hoc_calibrate_use_smECE_bins=self.config['post_hoc_calibrate_use_smECE_bins']) # start with model_args from command line
 
         
         if self.config['init_from'] == 'scratch':
@@ -1063,7 +1067,7 @@ def train_converse(config):
         else:
             print(colored(f"Round {r}: agent {agent_id} trains =================================================", 'light_yellow'))
             
-            agent = Agent(config, r, agent_id, current_model)
+            agent = Agent(config, r, agent_id, current_model, seed=int(config['seed']*10)+r)
             agent.train()
             current_model = agent.model
 

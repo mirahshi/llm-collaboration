@@ -1,5 +1,5 @@
 num_agents = 2
-num_rounds = 4
+num_rounds = 5
 start_from_round = 0 # which round to start from (begins at 0) 
 label_starting_round = False # label the starting round dataset using the model of the previous round
 save_models = True # save models after each round
@@ -30,6 +30,8 @@ compute_smooth_calibration = False # compute smooth calibration losses (memory i
 
 post_hoc_calibrate = False # post-hoc cross calibrate the model using the predictions of the previous round
 post_hoc_calibrate_multiplier = 1.0 # multiplier for post-hoc cross calibration loss
+post_hoc_calibrate_use_smECE = True # use sm cross ece loss for post-hoc calibration; if False, use CE loss
+post_hoc_calibrate_use_smECE_bins = 4 # number of bins for sm cross ece loss
 
 answer_tokens = ['0', '1'] # possible answer tokens
 append_predictions = False # append predictions to output file (default is sampled predictions unless append_argmax_predictions is True)
@@ -101,7 +103,7 @@ dropout = 0.0 # 0.2
 causal = True
 
 learning_rate = 1e-4 # 1e-3 # with baby networks can afford to go a bit higher
-max_iters = 25000
+max_iters = 2000
 lr_decay_iters = max_iters # make equal to max_iters usually
 min_lr = learning_rate / 10 # learning_rate / 10 usually
 beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
