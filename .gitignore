@@ -208,6 +208,8 @@ __marimo__/
 
 *.sh
 gpt_api_key.txt
+google_api_key.txt
+anthropic_api_key.txt
 out-*/
 wandb/
 scratch.py

@@ -52,7 +52,6 @@ def _ci95(values):
         return 0.0
     return 1.96 * arr.std(ddof=1) / np.sqrt(n)
 
-def measure_zero_one_losses(maze_conversation_logs):
 def measure_zero_one_losses(maze_conversation_logs, num_rounds):
     """
     Compute average 0/1 loss per round.
@@ -337,7 +336,7 @@ def ECE_multidim_new(probs, labels, K=5, K_cross=5, smooth=False, sigma=0.1, col
 
     return ece_loss
 
-def measure_calibration_losses(maze_conversation_logs, n_bootstrap=200, bootstrap_seed=0, num_rounds):
+def measure_calibration_losses(maze_conversation_logs, num_rounds, n_bootstrap=200, bootstrap_seed=0):
     """
     Compute the calibration losses for each round, with bootstrap-based 1.96 SE estimates.
     Args:
@@ -483,10 +482,13 @@ if __name__ == "__main__":
             filtered_logs = all_filtered_logs[run_name]
             print(colored(f"\nEvaluating {run_name} (on {len(filtered_logs)} mazes)", 'light_yellow'))
 
-        losses, losses_ci, _non_argmax_count = measure_zero_one_losses(filtered_logs)
-        success_rates, success_rates_ci = measure_maze_success_rates(filtered_logs)
-        disagreements, disagreements_ci = measure_disagreement(filtered_logs)
-        ece_losses, ece_losses_ci, cross_ece_losses, cross_ece_losses_ci = measure_calibration_losses(filtered_logs)
+        first_maze_idx = next(iter(filtered_logs))
+        num_rounds = len(filtered_logs[first_maze_idx][0]['full_responses'])
+
+        losses, losses_ci, _non_argmax_count = measure_zero_one_losses(filtered_logs, num_rounds)
+        success_rates, success_rates_ci = measure_maze_success_rates(filtered_logs, num_rounds)
+        disagreements, disagreements_ci = measure_disagreement(filtered_logs, num_rounds)
+        ece_losses, ece_losses_ci, cross_ece_losses, cross_ece_losses_ci = measure_calibration_losses(filtered_logs, num_rounds)
 
         results_per_run[run_name] = {
             'losses': losses, 'losses_ci': losses_ci,
