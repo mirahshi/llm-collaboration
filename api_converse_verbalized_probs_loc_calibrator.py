@@ -17,216 +17,11 @@ from tqdm import tqdm
 import numpy as np
 from pathlib import Path
 from openai import OpenAI
+import anthropic
+from google import genai
+from google.genai import types as genai_types
 
 from calibrator import load_calibrator, load_self_calibrator, calibrate_probabilities, self_calibrate_probabilities
-
-
-# ---------------------------------------------------------------------------
-# HuggingFace client shim – mirrors the subset of the OpenAI client used here
-# ---------------------------------------------------------------------------
-
-class _HFMessage:
-    def __init__(self, content: str):
-        self.content = content
-
-
-class _HFChoice:
-    def __init__(self, content: str):
-        self.message = _HFMessage(content)
-
-
-class _HFResponse:
-    def __init__(self, contents):
-        if isinstance(contents, str):
-            contents = [contents]
-        self.choices = [_HFChoice(c) for c in contents]
-
-
-class _HFCompletions:
-    def __init__(self, model, tokenizer, device, is_instruct: bool):
-        self._model = model
-        self._tokenizer = tokenizer
-        self._device = device
-        self._is_instruct = is_instruct
-
-    def create(self, model, messages, max_completion_tokens, temperature, top_p, n=1, **kwargs):
-        import torch
-
-        attention_mask = None
-
-        if self._is_instruct and hasattr(self._tokenizer, "apply_chat_template"):
-            # Instruct models: use chat template. return_dict=True so we get a
-            # real attention_mask of all ones — without it, generate() builds
-            # one as (input_ids != pad_token_id), which masks <|im_end|> in the
-            # prompt when pad_token == eos_token and breaks turn boundaries.
-            tokenized = self._tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                return_tensors="pt",
-                return_dict=True,
-            )
-            input_ids = tokenized["input_ids"]
-            attention_mask = tokenized["attention_mask"]
-
-            # Stop tokens for instruct models (chat-specific end tokens)
-            stop_token_ids = []
-            if self._tokenizer.eos_token_id is not None:
-                stop_token_ids.append(self._tokenizer.eos_token_id)
-            unk_id = self._tokenizer.unk_token_id
-            for stop_str in ["<|im_end|>", "<|end|>", "<|eot_id|>", "<|endoftext|>"]:
-                tok_id = self._tokenizer.convert_tokens_to_ids(stop_str)
-                if tok_id is None or tok_id == unk_id:
-                    continue
-                if tok_id not in stop_token_ids:
-                    stop_token_ids.append(tok_id)
-        else:
-            # Base models: use plain text completion (no chat template)
-            text = "\n".join(m["content"] for m in messages)
-            tokenized = self._tokenizer(text, return_tensors="pt")
-            input_ids = tokenized["input_ids"]
-            attention_mask = tokenized.get("attention_mask")
-            
-            # Stop tokens for base models (EOS + double newlines)
-            stop_token_ids = []
-            if self._tokenizer.eos_token_id is not None:
-                stop_token_ids.append(self._tokenizer.eos_token_id)
-            for stop_str in ["\n\n", "\n\n\n"]:
-                tok_ids = self._tokenizer.encode(stop_str, add_special_tokens=False)
-                if tok_ids:
-                    stop_token_ids.append(tok_ids[-1])
-        
-        input_ids = input_ids.to(self._device)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(self._device)
-
-        # Tile to batch size n so a single generate() call yields n independent
-        # samples (each batch row samples independently under do_sample=True).
-        if n > 1:
-            input_ids = input_ids.expand(n, -1).contiguous()
-            if attention_mask is not None:
-                attention_mask = attention_mask.expand(n, -1).contiguous()
-
-        # Remove duplicates while preserving order
-        seen = set()
-        stop_token_ids = [x for x in stop_token_ids if not (x in seen or seen.add(x))]
-
-        if not stop_token_ids:
-            stop_token_ids = [self._tokenizer.eos_token_id]
-
-        # Pick a pad id that is NOT an EOS — otherwise the auto-built attention
-        # mask masks EOS tokens (e.g. <|im_end|>) inside the prompt.
-        pad_token_id = self._tokenizer.pad_token_id
-        if pad_token_id is None or pad_token_id in stop_token_ids:
-            pad_token_id = 0
-        generate_kwargs = {
-            "input_ids": input_ids,
-            "max_new_tokens": max_completion_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "do_sample": True,
-            "repetition_penalty": 1.05,
-            "eos_token_id": stop_token_ids,
-            "pad_token_id": pad_token_id,
-        }
-        if attention_mask is not None:
-            generate_kwargs["attention_mask"] = attention_mask
-
-        with torch.no_grad():
-            output_ids = self._model.generate(**generate_kwargs)
-
-        # Decode only the newly generated tokens (strip the prompt) for each row
-        prompt_len = input_ids.shape[-1]
-        contents = []
-        for row in output_ids:
-            new_tokens = row[prompt_len:]
-            text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
-
-            # Post-process for base models: truncate at delimiter if present
-            if not self._is_instruct and "~" in text:
-                lines = text.split("\n")
-                result_lines = []
-                for line in lines:
-                    result_lines.append(line)
-                    if "~" in line:
-                        break
-                text = "\n".join(result_lines)
-
-            contents.append(text)
-
-        return _HFResponse(contents)
-
-
-class _HFChatNamespace:
-    def __init__(self, completions):
-        self.completions = completions
-
-
-class HuggingFaceClient:
-    """Drop-in replacement for the OpenAI client used in this script."""
-
-    def __init__(self, model_name: str, model_path: str):
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        import torch
-
-        # Detect if this is an instruct/chat model based on name
-        model_name_lower = model_name.lower()
-        is_instruct = any(kw in model_name_lower for kw in ["instruct", "chat", "-it"])
-        
-        print(f"Loading HuggingFace model '{model_name}' (cache: {model_path}) …")
-        print(f"  Mode: {'instruct (chat template)' if is_instruct else 'base (text completion)'}")
-        
-        self._tokenizer = AutoTokenizer.from_pretrained(
-            model_name, cache_dir=model_path
-        )
-        # Do NOT set pad_token = eos_token: that makes generate()'s auto
-        # attention mask hide every <|im_end|> in the prompt and breaks chat.
-        self._model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            cache_dir=model_path,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-        )
-        self._device = next(self._model.parameters()).device
-        self.chat = _HFChatNamespace(
-            _HFCompletions(self._model, self._tokenizer, self._device, is_instruct)
-        )
-
-
-class _Tee:
-    """Write to a log file, and optionally also to the original stdout."""
-
-    _ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
-
-    def __init__(self, log_path: str, verbose: bool = True):
-        self._stdout = sys.stdout
-        self._verbose = verbose
-        self._log = open(log_path, "w", buffering=1, encoding="utf-8")
-
-    def write(self, data: str):
-        if self._verbose:
-            self._stdout.write(data)
-        self._log.write(self._ansi_escape.sub("", data))
-
-    def flush(self):
-        self._stdout.flush()
-        self._log.flush()
-
-    def force_print(self, *args, **kwargs):
-        """Always print to terminal and log, regardless of verbose setting."""
-        import io
-        buf = io.StringIO()
-        print(*args, file=buf, **kwargs)
-        text = buf.getvalue()
-        self._stdout.write(text)
-        self._log.write(self._ansi_escape.sub("", text))
-
-    def close(self):
-        sys.stdout = self._stdout
-        self._log.close()
-
-    # Delegate attribute lookups (e.g. `isatty`) to the real stdout.
-    def __getattr__(self, name):
-        return getattr(self._stdout, name)
 
 
 def format_maze(maze_str):
@@ -253,15 +48,38 @@ class Agent():
         while attempts_used < 5:
             attempts_used += 1
             print(colored(f"Attempt {attempts_used} of 5", 'light_grey'))
-            response = self.client.responses.create(
-                model=self.config['model_name'],
-                input=[{"role": "user", "content": prompt}],
-                max_output_tokens=self.config['max_new_tokens'],
-                temperature=self.config['temperature'],
-                reasoning={"effort": "low"},
-                # top_p=self.config['top_p'],
+            if self.config['api'] == 'claude':
+                response = self.client.messages.create(
+                    model=self.config['model_name'],
+                    max_tokens=self.config['max_new_tokens'],
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=self.config['temperature'],
+                    thinking={"type": "adaptive"},
+                    output_config={"effort": "low"},
                 )
-            full_response = response.output_text.strip()
+                full_response = next(
+                    (b.text for b in response.content if b.type == "text"), ""
+                ).strip()
+            elif self.config['api'] == 'google':
+                response = self.client.models.generate_content(
+                    model=self.config['model_name'],
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(
+                        max_output_tokens=self.config['max_new_tokens'],
+                        temperature=self.config['temperature'],
+                    ),
+                )
+                full_response = (response.text or "").strip()
+            else:
+                response = self.client.responses.create(
+                    model=self.config['model_name'],
+                    input=[{"role": "user", "content": prompt}],
+                    max_output_tokens=self.config['max_new_tokens'],
+                    temperature=self.config['temperature'],
+                    reasoning={"effort": "low"},
+                    # top_p=self.config['top_p'],
+                    )
+                full_response = response.output_text.strip()
             print(colored(f"Full response: {full_response}", 'light_grey'))
 
             prob_vector = None
@@ -517,11 +335,9 @@ def str2bool(v):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Collaborative maze conversation using OpenAI or HuggingFace API")
-    parser.add_argument("--api", type=str, default="openai", choices=["openai", "huggingface"],
-                        help="Backend API to use: 'openai' (default) or 'huggingface'")
-    parser.add_argument("--model_path", type=str, default=None,
-                        help="Local cache directory for HuggingFace models (only used when --api huggingface)")
+    parser = argparse.ArgumentParser(description="Collaborative maze conversation using OpenAI, Claude, or Google API")
+    parser.add_argument("--api", type=str, default="openai", choices=["openai", "claude", "google"],
+                        help="Backend API to use: 'openai' (default), 'claude', or 'google'")
     parser.add_argument("--model_name", type=str, default="gpt-4.1-mini",
                         help="Model to use for the conversation")
     parser.add_argument("--max_new_tokens", type=int, default=2048,
@@ -567,11 +383,14 @@ if __name__ == "__main__":
     args = parse_args()
 
     # build client based on selected backend
-    if args.api == "huggingface":
-        if args.model_path is None:
-            raise ValueError("--model_path must be specified when using --api huggingface")
-        client = HuggingFaceClient(model_name=args.model_name, model_path=args.model_path)
-        print(f"Loaded HuggingFace client for model {args.model_name}")
+    if args.api == "claude":
+        api_key = Path("anthropic_api_key.txt").read_text().strip()
+        client = anthropic.Anthropic(api_key=api_key)
+        print(f"Loaded Claude client for model {args.model_name}")
+    elif args.api == "google":
+        api_key = Path("google_api_key.txt").read_text().strip()
+        client = genai.Client(api_key=api_key)
+        print(f"Loaded Google client for model {args.model_name}")
     else:
         api_key = Path("gpt_api_key.txt").read_text().strip()
         client = OpenAI(api_key=api_key)
@@ -619,7 +438,6 @@ if __name__ == "__main__":
         "out_dir": args.out_dir,
         "verbose": args.verbose,
         "api": args.api,
-        "model_path": args.model_path,
         "hard_input_data_dir": args.hard_input_data_dir,
         "validation_mode": args.validation_mode,
     }
