@@ -728,12 +728,13 @@ class GPT(nn.Module):
                     targets_answer_idx = labels.int().argmax(dim=-1) # (B, T) index of correct answer token
 
                     if self.config.post_hoc_calibrate_use_smECE:
-                        calibrator_sm_cross_ece_loss = self.ECE_multidim_new(calibrator_probs, labels, K=self.config.post_hoc_calibrate_use_smECE_bins, K_cross=self.config.post_hoc_calibrate_use_smECE_bins, smooth=True, sigma=0.1, collaborator_probs=collaborator_probs, confidence=self.config.confidence)
-                        loss = loss + calibrator_sm_cross_ece_loss * self.config.post_hoc_calibrate_multiplier
+                        calibrator_loss = self.ECE_multidim_new(calibrator_probs, labels, K=self.config.post_hoc_calibrate_use_smECE_bins, K_cross=self.config.post_hoc_calibrate_use_smECE_bins, smooth=True, sigma=0.1, collaborator_probs=collaborator_probs, confidence=self.config.confidence)
+                        loss = loss + calibrator_loss * self.config.post_hoc_calibrate_multiplier
                     else:
                         # use CE loss for post-hoc calibration
                         D_answer = calibrator_logits.size(-1)
-                        loss = loss + F.cross_entropy(calibrator_logits.reshape(-1, D_answer), targets_answer_idx.reshape(-1)) * self.config.post_hoc_calibrate_multiplier
+                        calibrator_loss = F.cross_entropy(calibrator_logits.reshape(-1, D_answer), targets_answer_idx.reshape(-1))
+                        loss = loss + calibrator_loss * self.config.post_hoc_calibrate_multiplier
 
                     with torch.no_grad():
                         if not self.config.post_hoc_calibrate_use_smECE:
