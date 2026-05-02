@@ -63,6 +63,13 @@ def prepare(input_file_path, out_dir, file_name_suffix='', save_original_data=Fa
         train_data = ''.join(train_lines)
         val_data = ''.join(val_lines)
 
+        # save train and val data to txt files
+        with open(os.path.join(out_dir, f'train{file_name_suffix}.txt'), 'w') as f:
+            f.write(train_data)
+        with open(os.path.join(out_dir, f'val{file_name_suffix}.txt'), 'w') as f:
+            f.write(val_data)
+        print(colored(f"saved train and val datasets to {os.path.join(out_dir, f'train{file_name_suffix}.txt')} and {os.path.join(out_dir, f'val{file_name_suffix}.txt')}", 'light_blue'))
+
         # encode both to integers
         train_ids = encode(train_data)
         val_ids = encode(val_data)
@@ -116,6 +123,7 @@ if __name__ == "__main__":
     parser.add_argument('--input_file', type=str, default=None, help='Path to the input file (e.g., data/majority-mask/input0_round0.txt)')
     parser.add_argument('--out_dir', type=str, default=None, help='Directory to save outputs (e.g., out-majority-mask)')
     parser.add_argument('--suffix', type=str, default='', help='Suffix to use for output files (e.g., 0_round0)')
+    parser.add_argument('--split', type=str, default='both', help='Split to use for output files (e.g., both, train, val)')
     args = parser.parse_args()
 
     if args.out_dir is not None:
@@ -124,11 +132,11 @@ if __name__ == "__main__":
         input_file = args.input_file
         if args.suffix is not None:
             suffix = args.suffix
-        prepare(input_file, out_dir, suffix, save_original_data=True)
+        prepare(input_file, out_dir, suffix, save_original_data=True, split=args.split)
     else:
         # prepare agent 0 and agent 1 input files from data directory
         data_dir = os.path.join("data", datasets[0])
         input_file0 = os.path.join(data_dir, 'input0_round0.txt')
         input_file1 = os.path.join(data_dir, 'input1_round0.txt')
-        prepare(input_file0, out_dir, '0_round0', save_original_data=True)
-        prepare(input_file1, out_dir, '1_round0', save_original_data=True)
+        prepare(input_file0, out_dir, '0_round0', save_original_data=True, split=args.split)
+        prepare(input_file1, out_dir, '1_round0', save_original_data=True, split=args.split)

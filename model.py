@@ -746,7 +746,7 @@ class GPT(nn.Module):
                         calibrator_zero_one_loss = self.zero_one_loss(calibrator_logits, targets_answer_idx)
                 else:
                     calibrator_logits = None
-                    calibrator_sm_cross_ece_loss = None
+                    calibrator_loss = None
                     calibrator_cross_ece_loss = None
                     calibrator_ece_loss = None
                     calibrator_entropy = None
@@ -757,7 +757,7 @@ class GPT(nn.Module):
                 sm_cross_ece_loss_multidim_new = None
                 agreement = None
                 calibrator_logits = None
-                calibrator_sm_cross_ece_loss = None
+                calibrator_loss = None
                 calibrator_cross_ece_loss = None
                 calibrator_ece_loss = None
                 calibrator_entropy = None
@@ -782,7 +782,7 @@ class GPT(nn.Module):
             sm_ece_loss_multidim_new = None
             cross_ece_loss_multidim_new = None
             sm_cross_ece_loss_multidim_new = None
-            calibrator_sm_cross_ece_loss = None
+            calibrator_loss = None
             calibrator_cross_ece_loss = None
             calibrator_ece_loss = None
             calibrator_entropy = None
@@ -798,7 +798,7 @@ class GPT(nn.Module):
             else:
                 calibrator_logits = None
 
-        return logits, calibrator_logits, CE_loss_sequence, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, calibrator_sm_cross_ece_loss, calibrator_cross_ece_loss, calibrator_ece_loss, calibrator_entropy, calibrator_agreement, calibrator_zero_one_loss, brier_score, zero_one_loss, entropy, agreement, ece_loss_temperature_scaled
+        return logits, calibrator_logits, CE_loss_sequence, loss, ece_loss_multidim_new, sm_ece_loss_multidim_new, cross_ece_loss_multidim_new, sm_cross_ece_loss_multidim_new, calibrator_loss, calibrator_cross_ece_loss, calibrator_ece_loss, calibrator_entropy, calibrator_agreement, calibrator_zero_one_loss, brier_score, zero_one_loss, entropy, agreement, ece_loss_temperature_scaled
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

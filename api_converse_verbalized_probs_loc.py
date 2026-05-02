@@ -244,80 +244,67 @@ class Agent():
 
     def generate_response(self, prompt, delimiter='~'):
         """
-        Returns: full response, final answer, probability vector, format failure.
-        Runs the prompt K times, computes empirical probabilities over d/r/u/l,
-        and samples the final answer from a multinomial over those probabilities.
-        format_failure is True only if ALL K responses failed to produce a valid answer.
+        Returns: full response, final answer, probability vector, format failure
+        format failure is True if the final answer is not in the target tokens or if the probabilities are not valid.
         """
-        K = self.config['num_samples']
         target_tokens = ['d', 'r', 'u', 'l']
-        counts = np.zeros(4)  # d, r, u, l
-        responses = [""] * K
-        answers = [None] * K
-        attempts_used = [0] * K
-        valid_count = 0
 
-        answer_re = re.compile(re.escape(delimiter) + r'\s*([drul])', re.IGNORECASE)
-        print(colored(f"===== BEGIN K={K} BLOCK =====", 'light_grey'))
-
-        # Run all K samples in one batched call; retry only the slots whose
-        # output failed the answer-format check, up to 5 attempts per slot.
-        remaining = list(range(K))
-        for attempt in range(5):
-            if not remaining:
-                break
-            print(colored(f"attempt {attempt+1} for {len(remaining)} sample(s)", 'light_grey'))
-            response = self.client.chat.completions.create(
+        attempts_used = 0
+        while attempts_used < 5:
+            attempts_used += 1
+            print(colored(f"Attempt {attempts_used} of 5", 'light_grey'))
+            response = self.client.responses.create(
                 model=self.config['model_name'],
-                messages=[{"role": "user", "content": prompt}],
-                max_completion_tokens=self.config['max_new_tokens'],
+                input=[{"role": "user", "content": prompt}],
+                max_output_tokens=self.config['max_new_tokens'],
                 temperature=self.config['temperature'],
-                top_p=self.config['top_p'],
-                n=len(remaining),
-            )
-            next_remaining = []
-            for i, idx in enumerate(remaining):
-                text = response.choices[i].message.content.strip()
-                responses[idx] = text
-                attempts_used[idx] = attempt + 1
-                m = answer_re.search(text)
-                if m:
-                    answers[idx] = m.group(1).lower()
-                    counts[target_tokens.index(answers[idx])] += 1
-                    valid_count += 1
-                else:
-                    next_remaining.append(idx)
-            remaining = next_remaining
+                reasoning={"effort": "low"},
+                # top_p=self.config['top_p'],
+                )
+            full_response = response.output_text.strip()
+            print(colored(f"Full response: {full_response}", 'light_grey'))
 
-        for k in range(K):
-            print(colored(f"--- sample {k+1}/{K} ---", 'light_grey'))
-            print(responses[k])
-            print(colored(f"    answer: {answers[k]}", 'light_cyan'))
-            print(colored(f"took {attempts_used[k]} attempts" if answers[k] else "failed to get a valid answer after 5 attempts", 'light_red'))
-
-            
-
-        # build concatenated full_response with markers
-        full_response_parts = [f"===== BEGIN K={K} BLOCK ====="]
-        for k, text in enumerate(responses):
-            full_response_parts.append(f"--- sample {k+1}/{K} ---")
-            full_response_parts.append(text)
-            full_response_parts.append(f"--- end sample {k+1}/{K} ---")
-        full_response_parts.append(f"===== END K={K} BLOCK =====")
-        full_response = "\n".join(full_response_parts)
-        print(colored(f"===== END K={K} BLOCK =====", 'light_grey'))
-
-        # determine format failure, prob vector, and final answer
-        if valid_count == 0:
-            format_failure = True
             prob_vector = None
             final_answer = None
-            print(colored(f"Warning: All {K} samples failed to produce a valid answer", 'light_red'))
-        else:
             format_failure = False
-            prob_vector = (counts / valid_count).tolist()
-            # sample final answer from multinomial over empirical probabilities
-            final_answer = np.random.choice(target_tokens, p=prob_vector)
+
+            # Parse final answer from response string
+            answer_match = re.search(re.escape(delimiter) + r'\s*([drul])', full_response, re.IGNORECASE)
+            if answer_match:
+                final_answer = answer_match.group(1).lower()
+                if final_answer not in target_tokens:
+                    format_failure = True
+                    continue
+            else:
+                print(colored(f"Warning: Delimiter '{delimiter}' followed by a valid move not found in response", 'light_red'))
+                format_failure = True
+                continue
+            
+            # Parse probabilities from response string
+            prob_match = re.search(r'%\s*\[([^\]]+)\]', full_response)
+            if prob_match:
+                prob_str = prob_match.group(1)
+                try:
+                    prob_vector = [float(p.strip()) for p in prob_str.split(',')]
+                except Exception as e:
+                    print(colored(f"Error parsing probabilities from string: {prob_str} ({e})", 'light_red'))
+                    prob_vector = None
+                    format_failure = True
+                    continue
+           
+                if abs(sum(prob_vector) - 1.0) > 1e-6 or len(prob_vector) != len(target_tokens):
+                    print(colored(f"Warning: Probabilities for [d,r,u,l] should be 4 numbers and sum to 1, got {prob_vector}", 'light_red'))
+                    prob_vector = None
+                    format_failure = True
+                    continue
+                break # valid response found
+            else:
+                print(colored(f"Warning: Probabilities for [d,r,u,l] should be 4 numbers, got {prob_vector}", 'light_red'))
+                prob_vector = None
+                format_failure = True
+                continue
+
+        print(colored(f"took {attempts_used} attempts" if final_answer else "failed to get a valid answer after 5 attempts", 'light_red'))
 
         return full_response, final_answer, prob_vector, format_failure
 
@@ -395,7 +382,10 @@ def api_converse(config, client, starting_prompts):
         # Use calibrated probabilities if available, otherwise use raw probabilities
         probs_for_prompt = renormalized_calibrated_prob_vector if renormalized_calibrated_prob_vector is not None else renormalized_prob_vector
 
-        prompt = f"The other agent answered with probabilities for [d,r,u,l]: {probs_for_prompt}."
+        if config['append_probabilities']:
+            prompt = f"The other agent answered with probabilities for [d,r,u,l]: {probs_for_prompt}."
+        else:
+            prompt = f"The other agent answered with: {final_answer.lower()}."
 
         # Track previous round's probabilities for calibration
         prev_prob_vector = probs_for_prompt
@@ -438,11 +428,17 @@ Legend:
         return_string += f"""
 This is the path to the goal that you have moved so far: {prefix}
 """
+#     return_string += """
+# Explain your reasoning, then you must answer with one of d, r, u, l. Put your final answer after the delimiter ~. For example, if your final answer is d, your response should contain ~d. 
+# """
     return_string += """
-Explain your reasoning, then you must answer with one of d, r, u, l. Put your final answer after the delimiter ~. For example, if your final answer is d, your response should contain ~d. 
+You must answer with one of d, r, u, l. Put your final answer after the delimiter ~. For example, if your final answer is d, your response should contain ~d. 
 """
     return_string += """
-Your moves are timed for speed so hurry up! 
+Finally, give the probabilities you think each move d, r, u, l is correct after the delimiter %. For example, if you think the probability of d, r, u, l is 0.8, 0.1, 0.05, 0.05, your response should contain %[0.8, 0.1, 0.05, 0.05]. Make sure it is a valid probability vector, i.e. the sum of the probabilities is 1.
+"""    
+    return_string += """
+Your moves are timed for speed so hurry up!
 """
     return return_string
 
@@ -479,8 +475,8 @@ def parse_args():
                         help="Number of agents")
     parser.add_argument("--solo", type=str2bool, default=False,
                         help="Run solo full info baseline instead of collaborative game")
-    parser.add_argument("--num_samples", type=int, default=10,
-                        help="Number of times (K) to run each prompt for empirical probability estimation")
+    parser.add_argument("--append_probabilities", type=str2bool, default=True,
+                        help="Append probabilities to the prompt. If False, append the final answer.")
     parser.add_argument("--calibrator_path", type=str, default=None,
                         help="Path to directory containing trained calibrator models (e.g., calibrator_plots/)")
     parser.add_argument("--data_dir", type=str, default="out-api_exp1",
@@ -529,7 +525,7 @@ if __name__ == "__main__":
         "num_rounds": args.num_rounds,
         "num_agents": args.num_agents,
         "solo": args.solo,
-        "num_samples": args.num_samples,
+        "append_probabilities": args.append_probabilities,
         "calibrator_models": calibrator_models,
         "data_dir": args.data_dir,
         "out_dir": args.out_dir,

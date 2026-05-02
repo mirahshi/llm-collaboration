@@ -31,14 +31,17 @@ def get_maze_conversation_logs_no_format_failures(maze_conversation_logs):
         maze_conversation_logs = maze_conversation_logs.item()
     
     maze_conversation_logs_no_format_failures = {}
+    maze_indices_with_format_failure = []
     for i, conversation_logs in maze_conversation_logs.items():
         has_format_failure = False
         for conversation_log in conversation_logs:
             if any(conversation_log['format_failures']):
+                maze_indices_with_format_failure.append(i)
                 has_format_failure = True
                 break
         if not has_format_failure and len(conversation_logs) > 0:
             maze_conversation_logs_no_format_failures[i] = conversation_logs
+    print(f"Maze indices with format failure: {maze_indices_with_format_failure}")
     return maze_conversation_logs_no_format_failures
 
 def _ci95(values):
@@ -50,6 +53,7 @@ def _ci95(values):
     return 1.96 * arr.std(ddof=1) / np.sqrt(n)
 
 def measure_zero_one_losses(maze_conversation_logs):
+def measure_zero_one_losses(maze_conversation_logs, num_rounds):
     """
     Compute average 0/1 loss per round.
 
@@ -65,6 +69,7 @@ def measure_zero_one_losses(maze_conversation_logs):
         losses_ci: dict mapping round number to 1.96 * standard error of the mean
         non_argmax_count: int, number of times final_answers[r] disagreed with argmax(prob_vectors[r])
     """
+    answer_tokens = ['d', 'r', 'u', 'l']
     answer_tokens = ['d', 'r', 'u', 'l']
     first_maze_idx = next(iter(maze_conversation_logs))
     num_rounds = len(maze_conversation_logs[first_maze_idx][0]['full_responses'])
@@ -93,7 +98,7 @@ def measure_zero_one_losses(maze_conversation_logs):
         losses_ci[r] = _ci95(round_losses)
     return losses, losses_ci, non_argmax_count
 
-def measure_disagreement(maze_conversation_logs):
+def measure_disagreement(maze_conversation_logs, num_rounds):
     """
     Compute average L2 distance between prob vectors of consecutive rounds.
     
@@ -104,8 +109,6 @@ def measure_disagreement(maze_conversation_logs):
         distances: dict mapping round number r to average L2 distance between prob vectors at r-1 and r
         distances_ci: dict mapping round number r to 1.96 * standard error of the mean
     """
-    first_maze_idx = next(iter(maze_conversation_logs))
-    num_rounds = len(maze_conversation_logs[first_maze_idx][0]['full_responses'])
 
     distances = {}
     distances_ci = {}
@@ -113,8 +116,14 @@ def measure_disagreement(maze_conversation_logs):
         round_distances = []
         for i, conversation_logs in maze_conversation_logs.items():
             for j, conversation_log in enumerate(conversation_logs):
-                prob_prev = conversation_log['prob_vectors'][r - 1]
-                prob_curr = conversation_log['prob_vectors'][r]
+                if conversation_log['calibrated_prob_vectors'][r - 1] is not None: # use calibrated probabilities from previous round
+                    prob_prev = conversation_log['calibrated_prob_vectors'][r - 1]
+                else: # use raw probabilities from previous round
+                    prob_prev = conversation_log['prob_vectors'][r - 1]
+                if conversation_log['calibrated_prob_vectors'][r] is not None: # use calibrated probabilities from current round
+                    prob_curr = conversation_log['calibrated_prob_vectors'][r]
+                else: # use raw probabilities from current round
+                    prob_curr = conversation_log['prob_vectors'][r]
                 if prob_prev is not None and prob_curr is not None:
                     l2_dist = np.linalg.norm(np.array(prob_prev) - np.array(prob_curr))
                     round_distances.append(l2_dist)
@@ -127,7 +136,7 @@ def measure_disagreement(maze_conversation_logs):
     return distances, distances_ci
 
 
-def measure_maze_success_rates(maze_conversation_logs):
+def measure_maze_success_rates(maze_conversation_logs, num_rounds):
     """
     Compute maze success rate per round.
 
@@ -187,14 +196,25 @@ def generate_calibration_data(maze_conversation_logs, round):
 
     for i, conversation_logs in maze_conversation_logs.items():
         for j, conversation_log in enumerate(conversation_logs):
-            prob = conversation_log['prob_vectors'][round]
-            # if round > 1: # for round 2 and beyond, use calibrated probabilities from previous round
-            #     collaborator_prob = conversation_log['calibrated_prob_vectors'][round - 1]
-            # else: # for round 1, use raw probabilities from round 0
-            if round > 0:
-                collaborator_prob = conversation_log['prob_vectors'][round - 1]
-            else:
+            # if round == 3:
+            #     print("raw prob: ", conversation_log['prob_vectors'][round])
+            if conversation_log['calibrated_prob_vectors'][round] is not None: # use calibrated probabilities from current round
+                prob = conversation_log['calibrated_prob_vectors'][round]
+                # if round == 3:
+                #     print("calibrated prob: ", prob)
+            else: # use raw probabilities from current round
+                prob = conversation_log['prob_vectors'][round]
+            
+            if round > 1 and conversation_log['calibrated_prob_vectors'][round - 1] is not None: # for round 2 and beyond, use calibrated probabilities from previous round
+                collaborator_prob = conversation_log['calibrated_prob_vectors'][round - 1]
+            elif round == 0:
                 collaborator_prob = None
+            else: # for round 1, use raw probabilities from round 0
+                collaborator_prob = conversation_log['prob_vectors'][round - 1]
+            # if round > 0:
+            #     collaborator_prob = conversation_log['prob_vectors'][round - 1]
+            # else:
+            #     collaborator_prob = None
             label_token = conversation_log['label']
             # print(f"collaborator_prob: {collaborator_prob}, prob: {prob}, label: {label_token}")
 
@@ -317,7 +337,7 @@ def ECE_multidim_new(probs, labels, K=5, K_cross=5, smooth=False, sigma=0.1, col
 
     return ece_loss
 
-def measure_calibration_losses(maze_conversation_logs, n_bootstrap=200, bootstrap_seed=0):
+def measure_calibration_losses(maze_conversation_logs, n_bootstrap=200, bootstrap_seed=0, num_rounds):
     """
     Compute the calibration losses for each round, with bootstrap-based 1.96 SE estimates.
     Args:
@@ -330,8 +350,6 @@ def measure_calibration_losses(maze_conversation_logs, n_bootstrap=200, bootstra
         cross_ece_losses: dict mapping round number to cross-calibration loss
         cross_ece_losses_ci: dict mapping round number to 1.96 * bootstrap standard error
     """
-    first_maze_idx = next(iter(maze_conversation_logs))
-    num_rounds = len(maze_conversation_logs[first_maze_idx][0]['full_responses'])
     answer_tokens = ['d', 'r', 'u', 'l']
 
     ece_losses = {}

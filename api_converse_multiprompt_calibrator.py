@@ -88,7 +88,7 @@ class Agent():
         for k in range(K):
             valid_response = False
             num_attempts = 5
-            while not valid_response:
+            while not valid_response and num_attempts > 0:
                 response = self.client.chat.completions.create(
                     model=self.config['model_name'],
                     messages=[{"role": "user", "content": prompt}],
@@ -113,6 +113,11 @@ class Agent():
                         valid_response = True
                     else:
                         answer = None
+                        num_attempts -= 1
+
+            if not valid_response:
+                print(colored(f"Warning: All {num_attempts} attempts failed to produce a valid answer", 'light_red'))
+                break
 
             print(colored(f"--- sample {k+1}/{K} ---", 'light_grey'))
             print(text)
@@ -219,13 +224,13 @@ def api_converse(config, client, starting_prompts, prior_conversation_log=None):
         print(colored(f"PROMPT: {prompt}", 'light_blue'))
         
         format_failure = True
-        num_attempts = 5
+        num_attempts = 2
         while format_failure and num_attempts > 0:
             full_response, final_answer, prob_vector, format_failure = agent.generate_response(prompt)
             num_attempts -= 1
         
         if format_failure:
-            raise ValueError(f"Format failure after {5} attempts")
+            raise ValueError(f"Format failure after {2} attempts")
         
         if prob_vector is not None:
             rounded_prob_vector = [round(p, 2) for p in prob_vector]
@@ -423,7 +428,7 @@ if __name__ == "__main__":
     conversations_dir = os.path.join(config["out_dir"], f"conversations{config['start_round']}")
     os.makedirs(conversations_dir, exist_ok=True)
 
-    if config['start_round'] > 0:
+    if start_round > 0:
         conversations_dir_prior = os.path.join(config["out_dir"], f"conversations{config['start_round'] - 1}")
         print(f"Path to saved conversations from prior rounds: {conversations_dir_prior}")
     else:
@@ -501,10 +506,6 @@ if __name__ == "__main__":
             maze_str1 = input_line1.split('=')[0].strip()
             label_sequence = input_line0.split('=')[1].strip()
 
-            # maze_str0 = "@??....?#?#??.??..??.?.#.?.#..?.??#*"
-            # maze_str1 = "@..????.?#?.#?#.??##?.???.????.?#.?*"
-            # label_sequence = "rrrrrddlddrd"
-
             if start_round > 0: # get conversation logs for this maze with data from previous rounds
                 prior_conversation_logs = np.load(os.path.join(conversations_dir_prior, f"maze_{i}.npy"), allow_pickle=True).item()
 
@@ -553,9 +554,6 @@ if __name__ == "__main__":
             # save conversation log for this maze
             np.save(os.path.join(conversations_dir, f"maze_{i}.npy"), {i: maze_conversation_logs[i]})
 
-            # if format_failure or wrong_move:
-                # continue
-
             if success:
                 success_count += 1
                 print("Success! The generated path matches the label sequence.")
@@ -565,6 +563,6 @@ if __name__ == "__main__":
             # print(f"Label sequence: {label_sequence}")
 
         _tee.force_print(f"Success rate: {success_count} / {num_mazes}")
-        _tee.force_print(f"Format failure rate: {format_failure_count} / {num_mazes}")
+        _tee.force_print(f"Format failure count: {format_failure_count}")
 
     _tee.close()
