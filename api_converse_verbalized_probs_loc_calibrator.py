@@ -18,7 +18,7 @@ import numpy as np
 from pathlib import Path
 from openai import OpenAI
 
-from calibrator import load_calibrator, load_round_0_calibrator, calibrate_probabilities, calibrate_round_0_probabilities
+from calibrator import load_calibrator, load_self_calibrator, calibrate_probabilities, self_calibrate_probabilities
 
 
 # ---------------------------------------------------------------------------
@@ -350,9 +350,14 @@ def api_converse(config, client, starting_prompts, prior_conversation_log=None):
                     # Get raw probs from prior log
                     current_raw = conversation_log['prob_vectors'][-1]  # p_{r-1} raw
                     print(colored(f"Base probs from round {prev_round}: {current_raw}", 'light_cyan'))
-                    if prev_round == 0: # round 1
+                    if not config.get('cross_calibrate', True):
+                        # Self-calibrate every round: only depends on current round's raw probs
+                        prompt_probs = self_calibrate_probabilities(
+                            config['calibrator_models'][prev_round], current_raw
+                        )
+                    elif prev_round == 0: # round 1
                         # apply calibrator for round 0
-                        prompt_probs = calibrate_round_0_probabilities(
+                        prompt_probs = self_calibrate_probabilities(
                             config['calibrator_models'][prev_round], current_raw
                         )
                     elif len(conversation_log['prob_vectors']) >= 2: # round 2 and beyond
@@ -362,12 +367,6 @@ def api_converse(config, client, starting_prompts, prior_conversation_log=None):
                         else:
                             prev_prev = conversation_log['prob_vectors'][-2]
                             print(colored(f"Base probs from round {prev_round - 1}: {prev_prev}", 'light_cyan'))
-                        # if len(prior_conversation_log['calibrated_prob_vectors']) >= 2 and prior_conversation_log['calibrated_prob_vectors'][-1] is not None: 
-                        #     prev_prev = prior_conversation_log['calibrated_prob_vectors'][-1]
-                        #     print(colored(f"Calibrated probs from round {prev_round - 1}: {prev_prev}", 'light_cyan'))
-                        # else:
-                        #     prev_prev = prior_conversation_log['prob_vectors'][-2]
-                        #     print(colored(f"Base probs from round {prev_round - 1}: {prev_prev}", 'light_cyan'))
                         # Apply calibrator for prev_round to get calibrated probs
                         prompt_probs = calibrate_probabilities(
                             config['calibrator_models'][prev_round], current_raw, prev_prev
@@ -541,6 +540,8 @@ def parse_args():
                         help="Number of times (K) to run each prompt for empirical probability estimation")
     parser.add_argument("--calibrator_path", type=str, default=None,
                         help="Path to directory containing trained calibrator models (e.g., calibrator_plots/)")
+    parser.add_argument("--cross_calibrate", type=str2bool, default=True,
+                        help="If True, use cross calibrator (current+prev round probs) for rounds >= 1 and self calibrator for round 0. If False, use self calibrator for every round.")
     parser.add_argument("--data_dir", type=str, default="out-api_exp1",
                         help="Directory containing input data")
     parser.add_argument("--out_dir", type=str, default="out-api_exp1/multiprompt_probs",
@@ -586,14 +587,16 @@ if __name__ == "__main__":
         else:
             start = args.start_round-1
             end = args.start_round
-        for r in range(start, end): 
-            if r == 0:
-                if os.path.exists(os.path.join(args.calibrator_path, f"calibrator_round{r}.pt")):
-                    calibrator_model, _, calibrator_round = load_round_0_calibrator(os.path.join(args.calibrator_path, f"calibrator_round{r}.pt"))
+        for r in range(start, end):
+            calibrator_file = os.path.join(args.calibrator_path, f"calibrator_round{r}.pt")
+            if not args.cross_calibrate or r == 0:
+                if os.path.exists(calibrator_file):
+                    calibrator_model, _, calibrator_round = load_self_calibrator(calibrator_file)
+                    print(f"Loaded self calibrator from {calibrator_file} (trained on round {calibrator_round})")
                     calibrator_models[r] = calibrator_model
             else:
-                calibrator_model, _, calibrator_round = load_calibrator(os.path.join(args.calibrator_path, f"calibrator_round{r}.pt"))
-                print(f"Loaded calibrator from {os.path.join(args.calibrator_path, f'calibrator_round{r}.pt')} (trained on round {calibrator_round})")
+                calibrator_model, _, calibrator_round = load_calibrator(calibrator_file)
+                print(f"Loaded cross calibrator from {calibrator_file} (trained on round {calibrator_round})")
                 calibrator_models[r] = calibrator_model
 
     start_round = args.start_round
@@ -609,6 +612,7 @@ if __name__ == "__main__":
         "solo": args.solo,
         "num_samples": args.num_samples,
         "calibrator_models": calibrator_models,
+        "cross_calibrate": args.cross_calibrate,
         "start_round": start_round,
         "end_round": end_round,
         "data_dir": args.data_dir,

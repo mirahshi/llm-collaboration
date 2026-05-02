@@ -52,7 +52,6 @@ def _ci95(values):
         return 0.0
     return 1.96 * arr.std(ddof=1) / np.sqrt(n)
 
-def measure_zero_one_losses(maze_conversation_logs):
 def measure_zero_one_losses(maze_conversation_logs, num_rounds):
     """
     Compute average 0/1 loss per round.
@@ -72,7 +71,6 @@ def measure_zero_one_losses(maze_conversation_logs, num_rounds):
     answer_tokens = ['d', 'r', 'u', 'l']
     answer_tokens = ['d', 'r', 'u', 'l']
     first_maze_idx = next(iter(maze_conversation_logs))
-    num_rounds = len(maze_conversation_logs[first_maze_idx][0]['full_responses'])
 
     losses = {}
     losses_ci = {}
@@ -151,7 +149,6 @@ def measure_maze_success_rates(maze_conversation_logs, num_rounds):
     """
     answer_tokens = ['d', 'r', 'u', 'l']
     first_maze_idx = next(iter(maze_conversation_logs))
-    num_rounds = len(maze_conversation_logs[first_maze_idx][0]['full_responses'])
 
     success_rates = {}
     success_rates_ci = {}
@@ -337,11 +334,12 @@ def ECE_multidim_new(probs, labels, K=5, K_cross=5, smooth=False, sigma=0.1, col
 
     return ece_loss
 
-def measure_calibration_losses(maze_conversation_logs, n_bootstrap=200, bootstrap_seed=0, num_rounds):
+def measure_calibration_losses(maze_conversation_logs, num_rounds, n_bootstrap=200, bootstrap_seed=0):
     """
     Compute the calibration losses for each round, with bootstrap-based 1.96 SE estimates.
     Args:
         maze_conversation_logs: dict mapping maze index to list of conversation_logs (one per move)
+        num_rounds: number of rounds to evaluate
         n_bootstrap: number of bootstrap resamples used to estimate the standard error
         bootstrap_seed: RNG seed for reproducible resampling
     Returns:
@@ -443,12 +441,13 @@ def plot_losses_and_success_rates(results_per_run, output_path, title=None):
 
 if __name__ == "__main__":
     group_name = "api_exp10"
-    run_names = ["verbalized-calibrator-val"]
-    conversations_subdirs = ["conversations0-3"]
+    run_names = ["verbalized-calibrator-self"]
+    conversations_subdirs = ["conversations3"]
     maze_conversation_logs_paths = [
         f'/vast/projects/surbhig/multi-agent-collab/out-{group_name}/{run_name}/{subdir}'
         for run_name, subdir in zip(run_names, conversations_subdirs)
     ]
+    num_rounds = 3
     filter_common_mazes = False  # if True, evaluate each run only on the intersection of mazes with no format failures across all runs
     plot = False
 
@@ -483,10 +482,10 @@ if __name__ == "__main__":
             filtered_logs = all_filtered_logs[run_name]
             print(colored(f"\nEvaluating {run_name} (on {len(filtered_logs)} mazes)", 'light_yellow'))
 
-        losses, losses_ci, _non_argmax_count = measure_zero_one_losses(filtered_logs)
-        success_rates, success_rates_ci = measure_maze_success_rates(filtered_logs)
-        disagreements, disagreements_ci = measure_disagreement(filtered_logs)
-        ece_losses, ece_losses_ci, cross_ece_losses, cross_ece_losses_ci = measure_calibration_losses(filtered_logs)
+        losses, losses_ci, _non_argmax_count = measure_zero_one_losses(filtered_logs, num_rounds)
+        success_rates, success_rates_ci = measure_maze_success_rates(filtered_logs, num_rounds)
+        disagreements, disagreements_ci = measure_disagreement(filtered_logs, num_rounds)
+        ece_losses, ece_losses_ci, cross_ece_losses, cross_ece_losses_ci = measure_calibration_losses(filtered_logs, num_rounds)
 
         results_per_run[run_name] = {
             'losses': losses, 'losses_ci': losses_ci,

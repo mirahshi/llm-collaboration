@@ -10,6 +10,16 @@ from api_converse_eval import get_maze_conversation_logs_no_format_failures
 
 plt = None
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
 class SelfCalibrateMLP(nn.Module):
     """
     Calibrate probabilities for a single round using a self-calibrator MLP.
@@ -87,22 +97,23 @@ def load_calibrator(model_path):
     model.eval()
     return model, answer_tokens, checkpoint['round']
 
-def load_round_0_calibrator(model_path):
+def load_self_calibrator(model_path):
     """
-    Load a trained round 0 calibrator model from disk.
+    Load a trained self-calibrator model
     
     Args:
         model_path: str, path to the saved model checkpoint
     Returns:
         model: CalibrateMLP, the loaded model in eval mode
         answer_tokens: list of answer tokens the model was trained on
+        round: int, the round the model was trained for
     """
     checkpoint = torch.load(model_path, weights_only=False)
     answer_tokens = checkpoint['answer_tokens']
     model = SelfCalibrateMLP(answer_tokens)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
-    return model, answer_tokens, 0
+    return model, answer_tokens, checkpoint['round']
 
 
 def calibrate_probabilities(model, current_probs, prev_probs):
@@ -133,9 +144,9 @@ def calibrate_probabilities(model, current_probs, prev_probs):
         
         return calibrated_probs.squeeze(0).tolist()
     
-def calibrate_round_0_probabilities(model, current_probs):
+def self_calibrate_probabilities(model, current_probs):
     """
-    Apply the calibrator to transform probabilities for round 0.
+    Apply the calibrator to transform probabilities to be self-calibrated.
     """
     with torch.no_grad():
         if isinstance(current_probs, list):
@@ -273,12 +284,13 @@ def label_entries(maze_conversation_log_path, input_file):
         np.save(maze_path, maze_conversation_logs)
 
     
-def generate_calibration_data(maze_conversation_log_path, round):
+def generate_calibration_data(maze_conversation_log_path, round, cross_calibrate=True):
     """
     Generate calibration data for a given round of the maze conversation logs.
     Args:
         maze_conversation_log_path: str, path to the maze conversation log
-        round > 0: int, the round to generate calibration data for
+        round: int, the round to generate calibration data for
+        cross_calibrate: bool, whether to cross calibrate or self calibrate
     Returns:
         probs, collaborator_probs: list of probability vectors
         labels: token indices of the correct answer tokens
@@ -296,11 +308,11 @@ def generate_calibration_data(maze_conversation_log_path, round):
         for i, conversation_logs in maze_conversation_logs.items():
             for j, conversation_log in enumerate(conversation_logs):
                 prob = conversation_log['prob_vectors'][round]
-                if round > 1: # for round 2 and beyond, use calibrated probabilities from previous round
+                if round > 1 and cross_calibrate: # for round 2 and beyond, use calibrated probabilities from previous round
                     collaborator_prob = conversation_log['calibrated_prob_vectors'][round - 1]
-                elif round == 1: # for round 1, use raw probabilities from round 0
+                elif round == 1 and cross_calibrate: # for round 1, use raw probabilities from round 0
                     collaborator_prob = conversation_log['prob_vectors'][round - 1]
-                else: # for round 0, use None
+                else: # for round 0 or not cross-calibrate, use None
                     collaborator_prob = None
                 label_token = conversation_log['label']
 
@@ -312,13 +324,13 @@ def generate_calibration_data(maze_conversation_log_path, round):
     N = len(probs)
     split_idx = int(N * 0.9)
     probs_train = torch.tensor(probs[:split_idx], dtype=torch.float32)
-    if round >= 1:
+    if round >= 1 and cross_calibrate:
         collaborator_probs_train = torch.tensor(collaborator_probs[:split_idx], dtype=torch.float32)
     else:
         collaborator_probs_train = None
     labels_train = torch.tensor(labels[:split_idx], dtype=torch.int64)
     probs_val = torch.tensor(probs[split_idx:], dtype=torch.float32)
-    if round >= 1:
+    if round >= 1 and cross_calibrate:
         collaborator_probs_val = torch.tensor(collaborator_probs[split_idx:], dtype=torch.float32)
     else:
         collaborator_probs_val = None
@@ -429,7 +441,7 @@ def train(
         model: nn.Module, the trained model
     """
     answer_tokens = model.answer_tokens
-    probs_train, collaborator_probs_train, labels_train, probs_val, collaborator_probs_val, labels_val = generate_calibration_data(maze_conversation_logs, round)
+    probs_train, collaborator_probs_train, labels_train, probs_val, collaborator_probs_val, labels_val = generate_calibration_data(maze_conversation_logs, round, cross_calibrate=True)
     
     # get base calibration losses
     train_ece_loss_base, train_cross_ece_loss_base, val_ece_loss_base, val_cross_ece_loss_base = base_calibration_losses(answer_tokens, probs_train, collaborator_probs_train, labels_train, probs_val, collaborator_probs_val, labels_val)
@@ -508,8 +520,8 @@ def train(
 
     return model, ece_losses, cross_ece_losses, train_losses, val_losses, val_ece_losses, val_cross_ece_losses, train_ece_loss_base, train_cross_ece_loss_base, val_ece_loss_base, val_cross_ece_loss_base
 
-def train_round_0(model, maze_conversation_logs, 
-    round=0,
+def train_self_calibrator(model, maze_conversation_logs, 
+    round,
     use_smECE=False,
     num_iters=1000,
     batch_size=256,
@@ -519,7 +531,7 @@ def train_round_0(model, maze_conversation_logs,
     min_learning_rate=1e-5,):
 
     answer_tokens = model.answer_tokens
-    probs_train, collaborator_probs_train, labels_train, probs_val, collaborator_probs_val, labels_val = generate_calibration_data(maze_conversation_logs, round)
+    probs_train, collaborator_probs_train, labels_train, probs_val, collaborator_probs_val, labels_val = generate_calibration_data(maze_conversation_logs, round, cross_calibrate=False)
     
     # get base calibration losses
     train_ece_loss_base, train_cross_ece_loss_base, val_ece_loss_base, val_cross_ece_loss_base = base_calibration_losses(answer_tokens, probs_train, collaborator_probs_train, labels_train, probs_val, collaborator_probs_val, labels_val)
@@ -610,12 +622,14 @@ if __name__ == "__main__":
     parser.add_argument("--maze_conversation_log_path", type=str, default="out-api_exp3/probs-rollouts/conversations", help="Path to maze conversation logs")
     parser.add_argument("--out_dir", type=str, default="out-api_exp3/calibrator", help="Output directory for calibration results")
     parser.add_argument("--round", type=int, default=1, help="Round to train calibrator for")
+    parser.add_argument("--cross_calibrate", type=str2bool, default=True, help="Whether to cross calibrate or self calibrate")
     args = parser.parse_args()
     config = {
         "maze_conversation_log_path": args.maze_conversation_log_path,
         "out_dir": args.out_dir,
         "answer_tokens": ['d', 'r', 'u', 'l'],
         "round": args.round,
+        "cross_calibrate": args.cross_calibrate,
         "num_iters": 10000, #5000,
         "use_smECE": False, # use smooth ECE loss to train calibrator
         "learning_rate": 1e-4,
@@ -631,7 +645,7 @@ if __name__ == "__main__":
     r = config["round"]
     print(f"Training calibrator for round {r}")
 
-    if r > 0:
+    if r > 0 and config["cross_calibrate"]:
         model = CalibrateMLP(config["answer_tokens"])
         calibrated_model, ece_losses, cross_ece_losses, train_losses, val_losses, val_ece_losses, val_cross_ece_losses, train_ece_loss_base, train_cross_ece_loss_base, val_ece_loss_base, val_cross_ece_loss_base = train(
             model,
@@ -646,13 +660,16 @@ if __name__ == "__main__":
         )
     else:
         model = SelfCalibrateMLP(config["answer_tokens"])
-        calibrated_model, ece_losses, train_losses, val_losses, val_ece_losses, train_ece_loss_base, val_ece_loss_base = train_round_0(
+        calibrated_model, ece_losses, train_losses, val_losses, val_ece_losses, train_ece_loss_base, val_ece_loss_base = train_self_calibrator(
             model,
             maze_conversation_logs=config["maze_conversation_log_path"],
             round=r,
             use_smECE=config["use_smECE"],
             num_iters=config["num_iters"],
             learning_rate=config["learning_rate"],
+            lr_scheduler=config["lr_scheduler"],
+            warmup_iters=config["warmup_iters"],
+            min_learning_rate=config["min_learning_rate"],
         )
 
     # plot losses
@@ -668,12 +685,12 @@ if __name__ == "__main__":
 
     line1, = plt.plot(ece_losses, label='train ECE loss')
     line2, = plt.plot(val_ece_losses, label='val ECE loss')
-    if r > 0:
+    if r > 0 and config["cross_calibrate"]:
         line3, = plt.plot(cross_ece_losses, label='train cross ECE loss')
         line4, = plt.plot(val_cross_ece_losses, label='val cross ECE loss')
     plt.plot([train_ece_loss_base] * len(ece_losses), label='train base ECE loss', linestyle='--', color=line1.get_color())
     plt.plot([val_ece_loss_base] * len(val_ece_losses), label='val base ECE loss', linestyle='--', color=line2.get_color())
-    if r > 0:
+    if r > 0 and config["cross_calibrate"]:
         plt.plot([train_cross_ece_loss_base] * len(cross_ece_losses), label='train base cross ECE loss', linestyle='--', color=line3.get_color())
         plt.plot([val_cross_ece_loss_base] * len(val_cross_ece_losses), label='val base cross ECE loss', linestyle='--', color=line4.get_color())
     plt.legend()
