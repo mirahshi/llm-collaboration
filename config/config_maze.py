@@ -17,6 +17,8 @@ eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 10 # don't print too too often
 
+maze_loc_formatting = True # format the maze locations in the data
+
 seed = 0
 
 # calibrate?

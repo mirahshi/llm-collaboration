@@ -66,6 +66,8 @@ block_size = 1024
 # prefix length to ignore in loss (overridden by config files like config/train_arithmetic.py)
 prefix_size = 0
 example_size = 0
+# maze data formatting
+maze_loc_formatting = False # format the maze locations in the data
 seed = 0
 # calibrate?
 calibrate = 'smECE' # self-calibrate: None, 'smECE', 'brier'
@@ -577,7 +579,14 @@ class Agent():
                 lines = lines[split_idx:]
             examples = [line.split(';')[0].rstrip('\n') for line in lines]
             # maze_starting_indices = [i for i, example in enumerate(examples) if example[-2] == '=']
-            maze_starting_indices = [i for i, example in enumerate(examples) if example[-self.config['m_lookahead']-1] == '=']
+            if self.config['maze_loc_formatting']: # non-padded formatting
+                if self.config['append_probabilities'] or self.config['append_predictions']:
+                    maze_examples = [example.split(',')[-1] for example in examples]
+                else:
+                    maze_examples = examples
+                maze_starting_indices = [i for i, example in enumerate(maze_examples) if example[0] == '@']
+            else: # padded formatting
+                maze_starting_indices = [i for i, example in enumerate(examples) if example[-self.config['m_lookahead']-1] == '=']
             num_available_mazes = len(maze_starting_indices)
             if num_available_mazes < num_mazes:
                 print(colored(f"Warning: only {num_available_mazes} mazes available, requested {num_mazes}", 'light_red'))
