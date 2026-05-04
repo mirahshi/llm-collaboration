@@ -8,6 +8,7 @@ import os
 def generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths=True, pad_solutions=False, pad_examples=False, mask=True, single_path=False, shortest_path=True, seed=42, last_s_steps=None, move_marker=False):
     examples0 = []
     examples1 = []
+    examples_full = []
 
     samples = generate_samples(width=width, height=height, wall_density=wall_density, n=n, all_paths=all_paths, seed=seed, mask=mask, single_path=single_path, shortest_path=shortest_path)
     for data in samples:
@@ -16,6 +17,7 @@ def generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths=Tru
             solution = data["solutions"][0]
             m1_flat = data["m1"].replace("\n", "")
             m2_flat = data["m2"].replace("\n", "")
+            full_flat = data["maze"].replace("\n", "")
 
             for k in range(len(solution) - m_lookahead + 1):
                 if last_s_steps is not None and (len(solution) - k) > last_s_steps:
@@ -23,20 +25,24 @@ def generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths=Tru
 
                 m1_chars = list(m1_flat)
                 m2_chars = list(m2_flat)
+                full_chars = list(full_flat)
 
                 # Clear @ from start position
                 m1_chars[0] = "."
                 m2_chars[0] = "."
+                full_chars[0] = "."
 
                 # Place @ at current path position
                 r, c = path[k]
                 flat_idx = r * width + c
                 m1_chars[flat_idx] = "@"
                 m2_chars[flat_idx] = "@"
+                full_chars[flat_idx] = "@"
 
                 next_moves = solution[k:k + m_lookahead]
                 examples0.append("".join(m1_chars) + "=" + next_moves)
                 examples1.append("".join(m2_chars) + "=" + next_moves)
+                examples_full.append("".join(full_chars) + "=" + next_moves)
         else:
             example0 = data["samples_m1"][0] + "*" * (m_lookahead-1)
             example1 = data["samples_m2"][0] + "*" * (m_lookahead-1)
@@ -102,6 +108,9 @@ def generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths=Tru
     with open(os.path.join(out_dir, "input1_round0.txt"), "w") as f:
         for example in examples1:
             f.write(example + "\n")
+    with open(os.path.join(out_dir, "input_full.txt"), "w") as f:
+        for example in examples_full:
+            f.write(example + "\n")
 
 
 if __name__ == "__main__":
@@ -128,7 +137,7 @@ if __name__ == "__main__":
     shortest_path = False
     seed = parser.parse_args().seed if parser.parse_args().seed is not None else 42
     m_lookahead = parser.parse_args().m_lookahead if parser.parse_args().m_lookahead is not None else 1
-    move_marker = parser.parse_args().move_marker
+    move_marker = True
     last_s_steps = None # generate examples with at most 4 steps to the finish (None to include all steps)
     t0 = time.time()
     generate(out_dir, n, m_lookahead, width, height, wall_density, all_paths, pad_solutions, pad_examples, mask, single_path, shortest_path, seed, last_s_steps, move_marker)
@@ -141,7 +150,7 @@ if __name__ == "__main__":
     print(f"\n{'='*40}")
     print(f"  First maze - Agent 0 ({len(lines)} steps)")
     print(f"{'='*40}")
-    for i, line in enumerate(lines):
+    for i, line in enumerate(lines[:20]):
         maze_part, sol_part = line.split("=")
         print(f"\n  Step {i}: predict '{sol_part}'")
         print(visualize_grid(maze_part, width=width))
